@@ -17,7 +17,6 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Optional;
-import java.util.function.UnaryOperator;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -47,11 +46,11 @@ class OrderServiceTest {
     void should_saveAndPublishToOutbox_whenOrderCreated() {
         when(repository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
-        var order = service.createOrder("c-1", new BigDecimal("99.90"), "CZK", "corr-1");
+        Order order = service.createOrder("c-1", new BigDecimal("99.90"), "CZK", "corr-1");
 
-        var captor = ArgumentCaptor.forClass(OrderCreated.class);
+        ArgumentCaptor<OrderCreated> captor = ArgumentCaptor.forClass(OrderCreated.class);
         verify(outbox).publish(eq("orders.created"), captor.capture());
-        var event = captor.getValue();
+        OrderCreated event = captor.getValue();
         assertThat(order.status()).isEqualTo(OrderStatus.PENDING_PAYMENT);
         assertThat(order.createdAt()).isEqualTo(NOW);
         assertThat(event.orderId()).isEqualTo(order.id());
@@ -62,60 +61,55 @@ class OrderServiceTest {
     @Test
     @DisplayName("PaymentCompleted převede objednávku do stavu PAID")
     void should_markPaid_whenPaymentCompleted() {
-        givenStoredOrder(pending());
+        Order order = pending();
+        when(repository.findForUpdate("o-1")).thenReturn(Optional.of(order));
 
-        var result = service.applyPaymentResult(PaymentCompleted.of("corr", "o-1", "p-1", BigDecimal.TEN));
+        service.applyPaymentResult(PaymentCompleted.of("corr", "o-1", "p-1", BigDecimal.TEN));
 
-        assertThat(result).get().satisfies(o -> {
-            assertThat(o.status()).isEqualTo(OrderStatus.PAID);
-            assertThat(o.paymentId()).isEqualTo("p-1");
-            assertThat(o.updatedAt()).isEqualTo(NOW);
-        });
+        assertThat(order.status()).isEqualTo(OrderStatus.PAID);
+        assertThat(order.paymentId()).isEqualTo("p-1");
+        assertThat(order.updatedAt()).isEqualTo(NOW);
     }
 
     @Test
     @DisplayName("PaymentFailed převede objednávku do stavu PAYMENT_FAILED s důvodem")
     void should_markFailed_whenPaymentFailed() {
-        givenStoredOrder(pending());
+        Order order = pending();
+        when(repository.findForUpdate("o-1")).thenReturn(Optional.of(order));
 
-        var result = service.applyPaymentResult(PaymentFailed.of("corr", "o-1", "declined"));
+        service.applyPaymentResult(PaymentFailed.of("corr", "o-1", "declined"));
 
-        assertThat(result).get().satisfies(o -> {
-            assertThat(o.status()).isEqualTo(OrderStatus.PAYMENT_FAILED);
-            assertThat(o.failureReason()).isEqualTo("declined");
-        });
+        assertThat(order.status()).isEqualTo(OrderStatus.PAYMENT_FAILED);
+        assertThat(order.failureReason()).isEqualTo("declined");
     }
 
     @Test
     @DisplayName("Finální stav se dalším výsledkem platby nezmění")
     void should_keepFinalState_whenSecondResultArrives() {
-        givenStoredOrder(pending().markPaid("p-1", NOW));
+        Order order = pending();
+        order.markPaid("p-1", NOW);
+        when(repository.findForUpdate("o-1")).thenReturn(Optional.of(order));
 
-        var result = service.applyPaymentResult(PaymentFailed.of("corr", "o-1", "late"));
+        service.applyPaymentResult(PaymentFailed.of("corr", "o-1", "late"));
 
-        assertThat(result).get().extracting(Order::status).isEqualTo(OrderStatus.PAID);
+        assertThat(order.status()).isEqualTo(OrderStatus.PAID);
+        assertThat(order.failureReason()).isNull();
     }
 
     @Test
     @DisplayName("Výsledek platby pro neznámou objednávku vrátí prázdno")
     void should_returnEmpty_whenOrderUnknown() {
-        when(repository.update(eq("unknown"), any())).thenReturn(Optional.empty());
+        when(repository.findForUpdate("unknown")).thenReturn(Optional.empty());
 
         assertThat(service.applyPaymentResult(PaymentFailed.of("corr", "unknown", "x"))).isEmpty();
     }
 
     @Test
-    @DisplayName("Hledání podle null ID vrátí prázdno")
-    void should_returnEmpty_whenFindByNullId() {
-        when(repository.findById(null)).thenReturn(Optional.empty());
+    @DisplayName("Hledání podle ID deleguje na repozitář")
+    void should_delegateFind_whenFindById() {
+        when(repository.findById("o-1")).thenReturn(Optional.of(pending()));
 
-        assertThat(service.findById(null)).isEmpty();
-    }
-
-    @SuppressWarnings("unchecked")
-    private void givenStoredOrder(Order stored) {
-        when(repository.update(eq(stored.id()), any())).thenAnswer(inv ->
-                Optional.of(((UnaryOperator<Order>) inv.getArgument(1)).apply(stored)));
+        assertThat(service.findById("o-1")).isPresent();
     }
 
     private static Order pending() {

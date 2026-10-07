@@ -1,117 +1,53 @@
 package cz.demo.eda.order.inbox;
 
-import org.springframework.jdbc.core.RowMapper;
-import org.springframework.jdbc.core.simple.JdbcClient;
-import org.springframework.stereotype.Repository;
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.QueryHint;
+import org.springframework.data.domain.Limit;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
-import java.time.ZoneOffset;
-import java.util.Objects;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-/** Přístup k tabulce inbox. */
-@Repository
-public class InboxRepository {
+/** Inbox – přijaté zprávy čekající na zpracování. */
+@Transactional(readOnly = true)
+public interface InboxRepository extends JpaRepository<InboxEntry, UUID> {
 
-    private static final int MAX_ERROR_LENGTH = 2000;
-    private static final RowMapper<InboxMessage> MAPPER = (rs, rowNum) -> new InboxMessage(
-            rs.getObject("event_id", UUID.class),
-            rs.getString("topic"),
-            rs.getString("message_key"),
-            rs.getString("payload"),
-            rs.getString("correlation_id"),
-            rs.getInt("attempts"));
+    /** jakarta.persistence.lock.timeout = -2 → Hibernate vygeneruje FOR UPDATE SKIP LOCKED. */
+    String SKIP_LOCKED = "-2";
 
-    private final JdbcClient jdbc;
-
-    public InboxRepository(JdbcClient jdbc) {
-        this.jdbc = jdbc;
-    }
-
-    /** Uloží přijatou zprávu; vrátí false, pokud zpráva se stejným eventId už v inboxu je (duplicita). */
-    public boolean store(UUID eventId, String topic, String key, String payload, String correlationId) {
-        Objects.requireNonNull(eventId, "eventId");
-        return jdbc.sql("""
-                        INSERT INTO inbox (event_id, topic, message_key, payload, correlation_id)
-                        VALUES (:eventId, :topic, :key, CAST(:payload AS jsonb), :correlationId)
-                        ON CONFLICT (event_id) DO NOTHING""")
-                .param("eventId", eventId)
-                .param("topic", topic)
-                .param("key", key)
-                .param("payload", payload)
-                .param("correlationId", correlationId)
-                .update() == 1;
-    }
+    /** ID čekajících zpráv, jejichž čas pokusu nastal, od nejstarší. */
+    @Query("""
+            select e.eventId from InboxEntry e
+             where e.status = cz.demo.eda.order.inbox.InboxStatus.PENDING and e.nextAttemptAt <= :now
+             order by e.receivedAt""")
+    List<UUID> findDueIds(Instant now, Limit limit);
 
     /**
-     * Zamkne nejstarší čekající zprávu, jejíž čas dalšího pokusu nastal. SKIP LOCKED dovolí
-     * paralelní zpracování více replikami. Musí běžet v transakci.
+     * Zamkne zprávu, pokud stále čeká a její čas nastal. SKIP LOCKED: zprávu, kterou právě zpracovává
+     * jiná replika, přeskočí (prázdný výsledek) místo čekání na zámek.
      */
-    public Optional<InboxMessage> lockNextDue() {
-        return jdbc.sql("""
-                        SELECT event_id, topic, message_key, payload::text AS payload, correlation_id, attempts
-                          FROM inbox
-                         WHERE status = 'PENDING' AND next_attempt_at <= now()
-                         ORDER BY received_at
-                         LIMIT 1
-                           FOR UPDATE SKIP LOCKED""")
-                .query(MAPPER)
-                .optional();
-    }
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = SKIP_LOCKED))
+    @Query("""
+            select e from InboxEntry e
+             where e.eventId = :eventId
+               and e.status = cz.demo.eda.order.inbox.InboxStatus.PENDING and e.nextAttemptAt <= :now""")
+    Optional<InboxEntry> lockIfDue(UUID eventId, Instant now);
 
-    /** Označí zprávu jako úspěšně zpracovanou. */
-    public void markProcessed(UUID eventId) {
-        jdbc.sql("UPDATE inbox SET status = 'PROCESSED', processed_at = now(), last_error = NULL WHERE event_id = :id")
-                .param("id", eventId)
-                .update();
-    }
+    /** Načte zprávu se zámkem řádku (čeká, dokud ho jiná transakce neuvolní). */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select e from InboxEntry e where e.eventId = :eventId")
+    Optional<InboxEntry> findForUpdate(UUID eventId);
 
-    /** Naplánuje další pokus o zpracování. */
-    public void scheduleRetry(UUID eventId, int attempts, Instant nextAttemptAt, String error) {
-        jdbc.sql("""
-                        UPDATE inbox SET attempts = :attempts, next_attempt_at = :next, last_error = :error
-                         WHERE event_id = :id""")
-                .param("id", eventId)
-                .param("attempts", attempts)
-                .param("next", nextAttemptAt.atOffset(ZoneOffset.UTC))
-                .param("error", truncate(error))
-                .update();
-    }
-
-    /** Označí zprávu jako definitivně neúspěšnou (po vyčerpání pokusů). */
-    public void markFailed(UUID eventId, int attempts, String error) {
-        jdbc.sql("""
-                        UPDATE inbox SET status = 'FAILED', attempts = :attempts, last_error = :error, processed_at = now()
-                         WHERE event_id = :id""")
-                .param("id", eventId)
-                .param("attempts", attempts)
-                .param("error", truncate(error))
-                .update();
-    }
-
-    /**
-     * Smaže nejvýše {@code limit} dokončených zpráv (PROCESSED / FAILED) zpracovaných před {@code cutoff}.
-     * Čekající zprávy nemaže nikdy. Vrátí počet smazaných řádků.
-     */
-    public int deleteFinishedBefore(Instant cutoff, int limit) {
-        return jdbc.sql("""
-                        DELETE FROM inbox
-                         WHERE event_id IN (SELECT event_id FROM inbox
-                                             WHERE status <> 'PENDING' AND processed_at < :cutoff
-                                             LIMIT :limit)""")
-                .param("cutoff", cutoff.atOffset(ZoneOffset.UTC))
-                .param("limit", limit)
-                .update();
-    }
-
-    /** Vrátí stav zprávy (PENDING / PROCESSED / FAILED), pokud v inboxu je. */
-    public Optional<String> findStatus(UUID eventId) {
-        return jdbc.sql("SELECT status FROM inbox WHERE event_id = :id").param("id", eventId)
-                .query(String.class).optional();
-    }
-
-    private static String truncate(String value) {
-        return value == null || value.length() <= MAX_ERROR_LENGTH ? value : value.substring(0, MAX_ERROR_LENGTH);
-    }
+    /** ID dokončených zpráv (PROCESSED / FAILED) zpracovaných před cutoff. */
+    @Query("""
+            select e.eventId from InboxEntry e
+             where e.status <> cz.demo.eda.order.inbox.InboxStatus.PENDING and e.processedAt < :cutoff""")
+    List<UUID> findFinishedIdsBefore(Instant cutoff, Limit limit);
 }

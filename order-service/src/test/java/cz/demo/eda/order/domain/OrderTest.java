@@ -15,39 +15,56 @@ class OrderTest {
     private static final Instant T1 = Instant.parse("2026-01-01T10:00:05Z");
 
     @Test
-    @DisplayName("Nová objednávka čeká na platbu")
-    void should_bePendingPayment_whenCreated() {
-        var order = Order.create("o-1", "c-1", BigDecimal.TEN, "CZK", T0);
+    @DisplayName("Nová objednávka čeká na platbu a je nová pro Spring Data")
+    void should_bePendingPaymentAndNew_whenCreated() {
+        Order order = Order.create("o-1", "c-1", BigDecimal.TEN, "CZK", T0);
 
         assertThat(order.status()).isEqualTo(OrderStatus.PENDING_PAYMENT);
         assertThat(order.createdAt()).isEqualTo(T0).isEqualTo(order.updatedAt());
+        assertThat(order.isNew()).isTrue();
+        assertThat(order.getId()).isEqualTo("o-1");
     }
 
     @Test
     @DisplayName("Po zaplacení nese paymentId a nový čas změny")
     void should_bePaid_whenMarkedPaid() {
-        var paid = Order.create("o-1", "c-1", BigDecimal.TEN, "CZK", T0).markPaid("p-1", T1);
+        Order order = Order.create("o-1", "c-1", BigDecimal.TEN, "CZK", T0);
 
-        assertThat(paid.status()).isEqualTo(OrderStatus.PAID);
-        assertThat(paid.paymentId()).isEqualTo("p-1");
-        assertThat(paid.createdAt()).isEqualTo(T0);
-        assertThat(paid.updatedAt()).isEqualTo(T1);
+        order.markPaid("p-1", T1);
+
+        assertThat(order.status()).isEqualTo(OrderStatus.PAID);
+        assertThat(order.paymentId()).isEqualTo("p-1");
+        assertThat(order.createdAt()).isEqualTo(T0);
+        assertThat(order.updatedAt()).isEqualTo(T1);
     }
 
     @Test
-    @DisplayName("Po zamítnutí platby nese důvod selhání")
+    @DisplayName("Po zamítnutí platby nese důvod selhání a žádné paymentId")
     void should_bePaymentFailed_whenMarkedFailed() {
-        var failed = Order.create("o-1", "c-1", BigDecimal.TEN, "CZK", T0).markPaymentFailed("declined", T1);
+        Order order = Order.create("o-1", "c-1", BigDecimal.TEN, "CZK", T0);
 
-        assertThat(failed.status()).isEqualTo(OrderStatus.PAYMENT_FAILED);
-        assertThat(failed.failureReason()).isEqualTo("declined");
-        assertThat(failed.paymentId()).isNull();
+        order.markPaymentFailed("declined", T1);
+
+        assertThat(order.status()).isEqualTo(OrderStatus.PAYMENT_FAILED);
+        assertThat(order.failureReason()).isEqualTo("declined");
+        assertThat(order.paymentId()).isNull();
     }
 
     @Test
-    @DisplayName("Odmítne objednávku bez ID")
-    void should_throw_whenIdIsNull() {
+    @DisplayName("Odmítne objednávku bez ID nebo částky")
+    void should_throw_whenIdOrAmountIsNull() {
         assertThatNullPointerException().isThrownBy(() -> Order.create(null, "c", BigDecimal.ONE, "CZK", T0));
+        assertThatNullPointerException().isThrownBy(() -> Order.create("o", "c", null, "CZK", T0));
+    }
+
+    @Test
+    @DisplayName("Rovnost entit je dána ID")
+    void should_beEqual_whenIdsMatch() {
+        Order first = Order.create("o-1", "c-1", BigDecimal.TEN, "CZK", T0);
+        Order second = Order.create("o-1", "c-2", BigDecimal.ONE, "EUR", T1);
+
+        assertThat(first).isEqualTo(second).hasSameHashCodeAs(second);
+        assertThat(first).isNotEqualTo(Order.create("o-2", "c-1", BigDecimal.TEN, "CZK", T0));
     }
 
     @Test

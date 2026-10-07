@@ -1,22 +1,28 @@
 package cz.demo.eda.payment.outbox;
 
 import cz.demo.eda.payment.event.DomainEvent;
-import cz.demo.eda.payment.inbox.InboxMessage;
+import cz.demo.eda.payment.inbox.InboxEntry;
 import cz.demo.eda.payment.support.Topics;
 import cz.demo.eda.payment.support.Tracing;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.time.Clock;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
-/** Zapisuje odchozí zprávy do outboxu – samotné odeslání do Kafky obstará {@link OutboxRelay}. */
-@Component
+/**
+ * Zapisuje odchozí zprávy do outboxu – samotné odeslání do Kafky obstará {@link OutboxService}.
+ * MANDATORY: zápis musí být součástí transakce volajícího servisu, jinak by se ztratila atomicita
+ * s doménovou změnou.
+ */
+@Service
+@Transactional(propagation = Propagation.MANDATORY)
 public class OutboxPublisher {
 
     /** Hlavičky DLT zprávy z inboxu (analogie kafka_dlt-* hlaviček Spring Kafka). */
@@ -30,33 +36,34 @@ public class OutboxPublisher {
 
     private final OutboxRepository repository;
     private final JsonMapper jsonMapper;
+    private final Clock clock;
 
-    public OutboxPublisher(OutboxRepository repository, JsonMapper jsonMapper) {
+    public OutboxPublisher(OutboxRepository repository, JsonMapper jsonMapper, Clock clock) {
         this.repository = repository;
         this.jsonMapper = jsonMapper;
+        this.clock = clock;
     }
 
-    /**
-     * Zařadí doménovou událost k odeslání s klíčem orderId.
-     * MANDATORY: bez okolní transakce by se ztratila atomicita s doménovou změnou.
-     */
-    @Transactional(propagation = Propagation.MANDATORY)
+    /** Zařadí doménovou událost k odeslání s klíčem orderId. */
     public void publish(String topic, DomainEvent event) {
-        repository.insert(event.eventId(), topic, event.orderId(), jsonMapper.writeValueAsString(event),
-                correlationHeader(event.correlationId()));
+        repository.save(OutboxEntry.pending(event.eventId(), topic, event.orderId(), jsonMapper.writeValueAsString(event),
+                correlationHeader(event.correlationId()), clock.instant()));
         log.debug("{} {} for order {} stored in outbox", event.getClass().getSimpleName(), event.eventId(),
                 event.orderId());
     }
 
-    /** Zařadí zprávu z inboxu, kterou se nepodařilo zpracovat, do &lt;topic&gt;.DLT s důvodem selhání. */
-    @Transactional(propagation = Propagation.MANDATORY)
-    public void publishDeadLetter(InboxMessage message, int attempts, Exception cause) {
-        var headers = new HashMap<>(correlationHeader(message.correlationId()));
-        headers.put(DLT_ORIGINAL_TOPIC, message.topic());
+    /**
+     * Zařadí zprávu z inboxu, kterou se nepodařilo zpracovat, do &lt;topic&gt;.DLT s důvodem selhání
+     * a počtem pokusů.
+     */
+    public void publishDeadLetter(InboxEntry entry, Exception cause) {
+        Map<String, String> headers = new HashMap<>(correlationHeader(entry.correlationId()));
+        headers.put(DLT_ORIGINAL_TOPIC, entry.topic());
         headers.put(DLT_EXCEPTION_FQCN, cause.getClass().getName());
         headers.put(DLT_EXCEPTION_MESSAGE, truncate(Objects.toString(cause.getMessage(), "")));
-        headers.put(DLT_ATTEMPTS, Integer.toString(attempts));
-        repository.insert(message.eventId(), Topics.dltOf(message.topic()), message.key(), message.payload(), headers);
+        headers.put(DLT_ATTEMPTS, Integer.toString(entry.attempts()));
+        repository.save(OutboxEntry.pending(entry.eventId(), Topics.dltOf(entry.topic()), entry.messageKey(),
+                entry.payload(), headers, clock.instant()));
     }
 
     private static Map<String, String> correlationHeader(String correlationId) {

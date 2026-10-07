@@ -4,129 +4,119 @@ import cz.demo.eda.payment.PostgresTestcontainer;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
 import org.springframework.boot.jdbc.test.autoconfigure.AutoConfigureTestDatabase;
-import org.springframework.boot.jdbc.test.autoconfigure.JdbcTest;
+import org.springframework.boot.jpa.test.autoconfigure.TestEntityManager;
 import org.springframework.context.annotation.Import;
+import org.springframework.data.domain.Limit;
 
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
-@JdbcTest
+@DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import({PostgresTestcontainer.class, InboxRepository.class})
+@Import(PostgresTestcontainer.class)
 class InboxRepositoryTest {
 
-    private static final String PAYLOAD = "{\"orderId\":\"o-1\"}";
+    private static final Instant NOW = Instant.now().truncatedTo(ChronoUnit.MICROS);
+    private static final String PAYLOAD = "{\"orderId\": \"o-1\", \"type\": \"PaymentCompleted\"}";
 
     @Autowired
     private InboxRepository repository;
+    @Autowired
+    private TestEntityManager em;
 
     @Test
-    @DisplayName("Novou zprávu uloží jako PENDING a vrátí ji ke zpracování")
-    void should_storeAndReturnPending_whenNewMessage() {
-        var id = UUID.randomUUID();
+    @DisplayName("Uloženou zprávu načte z DB i s JSON payloadem")
+    void should_loadAllFields_whenSaved() {
+        UUID id = UUID.randomUUID();
+        repository.save(entry(id));
+        em.flush();
+        em.clear();
 
-        assertThat(repository.store(id, "payments.result", "o-1", PAYLOAD, "corr-1")).isTrue();
+        assertThat(repository.findById(id)).get().satisfies(e -> {
+            assertThat(e.status()).isEqualTo(InboxStatus.PENDING);
+            assertThat(e.messageKey()).isEqualTo("o-1");
+            assertThat(e.correlationId()).isEqualTo("corr-1");
+            assertThat(e.payload()).contains("\"orderId\"", "o-1");
+            assertThat(e.receivedAt()).isEqualTo(NOW);
+            assertThat(e.isNew()).isFalse();
+        });
+        assertThat(repository.existsById(id)).isTrue();
+    }
 
-        assertThat(repository.findStatus(id)).contains("PENDING");
-        assertThat(repository.lockNextDue()).get().satisfies(m -> {
-            assertThat(m.eventId()).isEqualTo(id);
-            assertThat(m.key()).isEqualTo("o-1");
-            assertThat(m.correlationId()).isEqualTo("corr-1");
-            assertThat(m.attempts()).isZero();
-            assertThat(m.payload()).contains("o-1");
+    @Test
+    @DisplayName("Mezi připravenými jsou jen čekající zprávy, jejichž čas nastal, od nejstarší")
+    void should_returnOnlyDuePendingIds_whenQueried() {
+        InboxEntry due = entry(UUID.randomUUID());
+        InboxEntry later = entry(UUID.randomUUID());
+        later.scheduleRetry(NOW.plusSeconds(60), "boom");
+        InboxEntry done = entry(UUID.randomUUID());
+        done.markProcessed(NOW);
+        repository.save(due);
+        repository.save(later);
+        repository.save(done);
+        em.flush();
+
+        assertThat(repository.findDueIds(NOW.plusSeconds(1), Limit.of(10))).containsExactly(due.eventId());
+        assertThat(repository.findDueIds(NOW.minusSeconds(1), Limit.of(10))).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Zamkne jen zprávu, která čeká a jejíž čas nastal")
+    void should_lockOnlyDuePendingEntry_whenLocking() {
+        InboxEntry entry = entry(UUID.randomUUID());
+        repository.save(entry);
+        em.flush();
+        em.clear();
+
+        assertThat(repository.lockIfDue(entry.eventId(), NOW.minusSeconds(1))).isEmpty();
+        assertThat(repository.lockIfDue(entry.eventId(), NOW.plusSeconds(1))).isPresent();
+        assertThat(repository.lockIfDue(UUID.randomUUID(), NOW.plusSeconds(1))).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Stav a pokusy se uloží dirty checkingem")
+    void should_persistFailedState_whenEntryModified() {
+        UUID id = UUID.randomUUID();
+        repository.save(entry(id));
+        em.flush();
+        em.clear();
+
+        repository.findForUpdate(id).orElseThrow().markFailed("boom", NOW);
+        em.flush();
+        em.clear();
+
+        assertThat(repository.findById(id)).get().satisfies(e -> {
+            assertThat(e.status()).isEqualTo(InboxStatus.FAILED);
+            assertThat(e.attempts()).isEqualTo(1);
+            assertThat(e.lastError()).isEqualTo("boom");
         });
     }
 
     @Test
-    @DisplayName("Duplicitní eventId podruhé neuloží")
-    void should_returnFalse_whenEventIdAlreadyStored() {
-        var id = UUID.randomUUID();
-        repository.store(id, "t", "k", PAYLOAD, null);
+    @DisplayName("Pro úklid vrátí jen dokončené zprávy starší než cutoff, s limitem")
+    void should_returnOnlyFinishedOldIds_whenCleaningUp() {
+        InboxEntry processed = entry(UUID.randomUUID());
+        processed.markProcessed(NOW.minusSeconds(3600));
+        InboxEntry failed = entry(UUID.randomUUID());
+        failed.markFailed("boom", NOW.minusSeconds(3600));
+        InboxEntry pending = entry(UUID.randomUUID());
+        repository.save(processed);
+        repository.save(failed);
+        repository.save(pending);
+        em.flush();
 
-        assertThat(repository.store(id, "t", "k", PAYLOAD, null)).isFalse();
+        assertThat(repository.findFinishedIdsBefore(NOW.minusSeconds(7200), Limit.of(10))).isEmpty();
+        assertThat(repository.findFinishedIdsBefore(NOW, Limit.of(10)))
+                .containsExactlyInAnyOrder(processed.eventId(), failed.eventId());
+        assertThat(repository.findFinishedIdsBefore(NOW, Limit.of(1))).hasSize(1);
     }
 
-    @Test
-    @DisplayName("Odmítne null eventId")
-    void should_throw_whenEventIdIsNull() {
-        assertThatNullPointerException().isThrownBy(() -> repository.store(null, "t", "k", PAYLOAD, null));
-    }
-
-    @Test
-    @DisplayName("Prázdný inbox nevrátí nic ke zpracování")
-    void should_returnEmpty_whenInboxEmpty() {
-        assertThat(repository.lockNextDue()).isEmpty();
-    }
-
-    @Test
-    @DisplayName("Zprávu s retry v budoucnu zatím nevrátí, s retry v minulosti ano")
-    void should_respectNextAttempt_whenRetryScheduled() {
-        var id = UUID.randomUUID();
-        repository.store(id, "t", "k", PAYLOAD, null);
-
-        repository.scheduleRetry(id, 1, Instant.now().plusSeconds(60), "boom");
-        assertThat(repository.lockNextDue()).isEmpty();
-
-        repository.scheduleRetry(id, 2, Instant.now().minusSeconds(1), "boom");
-        assertThat(repository.lockNextDue()).get().extracting(InboxMessage::attempts).isEqualTo(2);
-    }
-
-    @Test
-    @DisplayName("Zpracovanou ani neúspěšnou zprávu už nevrátí")
-    void should_skipFinishedMessages_whenProcessedOrFailed() {
-        var processed = UUID.randomUUID();
-        var failed = UUID.randomUUID();
-        repository.store(processed, "t", "k", PAYLOAD, null);
-        repository.store(failed, "t", "k", PAYLOAD, null);
-
-        repository.markProcessed(processed);
-        repository.markFailed(failed, 4, "x".repeat(3000));
-
-        assertThat(repository.findStatus(processed)).contains("PROCESSED");
-        assertThat(repository.findStatus(failed)).contains("FAILED");
-        assertThat(repository.lockNextDue()).isEmpty();
-    }
-
-    @Test
-    @DisplayName("Úklid smaže jen dokončené zprávy starší než cutoff, čekající nechá")
-    void should_deleteOnlyFinishedOldMessages_whenCleanedUp() {
-        var processed = UUID.randomUUID();
-        var failed = UUID.randomUUID();
-        var pending = UUID.randomUUID();
-        repository.store(processed, "t", "k", PAYLOAD, null);
-        repository.store(failed, "t", "k", PAYLOAD, null);
-        repository.store(pending, "t", "k", PAYLOAD, null);
-        repository.markProcessed(processed);
-        repository.markFailed(failed, 4, "boom");
-
-        assertThat(repository.deleteFinishedBefore(Instant.now().minusSeconds(3600), 100)).isZero();
-        assertThat(repository.deleteFinishedBefore(Instant.now().plusSeconds(60), 100)).isEqualTo(2);
-
-        assertThat(repository.findStatus(processed)).isEmpty();
-        assertThat(repository.findStatus(failed)).isEmpty();
-        assertThat(repository.findStatus(pending)).contains("PENDING");
-    }
-
-    @Test
-    @DisplayName("Úklid respektuje limit dávky")
-    void should_respectLimit_whenCleaningUp() {
-        for (int i = 0; i < 3; i++) {
-            var id = UUID.randomUUID();
-            repository.store(id, "t", "k", PAYLOAD, null);
-            repository.markProcessed(id);
-        }
-
-        assertThat(repository.deleteFinishedBefore(Instant.now().plusSeconds(60), 2)).isEqualTo(2);
-        assertThat(repository.deleteFinishedBefore(Instant.now().plusSeconds(60), 2)).isEqualTo(1);
-    }
-
-    @Test
-    @DisplayName("Pro neznámé eventId vrátí prázdný stav")
-    void should_returnEmptyStatus_whenUnknown() {
-        assertThat(repository.findStatus(UUID.randomUUID())).isEmpty();
+    private static InboxEntry entry(UUID id) {
+        return InboxEntry.received(id, "orders.created", "o-1", PAYLOAD, "corr-1", NOW);
     }
 }

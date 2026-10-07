@@ -11,9 +11,17 @@ spring:
     username: ${DB_USERNAME:payment_service}
     password: ${DB_PASSWORD:payment_service}
     hikari:
-      # Vlastní schéma služby – SQL v repozitářích nemusí uvádět prefix payments.
+      # Vlastní schéma služby (search_path) – dotazy nemusí uvádět prefix payments.
       schema: payments
       maximum-pool-size: 5
+  jpa:
+    # REST API nepotřebuje lazy loading ve view – spojení s DB se nedrží po celý request.
+    open-in-view: false
+    hibernate:
+      # Schéma spravuje Flyway; Hibernate jen ověří, že entity odpovídají tabulkám.
+      ddl-auto: validate
+    properties:
+      hibernate.default_schema: payments
   flyway:
     schemas: payments
     default-schema: payments

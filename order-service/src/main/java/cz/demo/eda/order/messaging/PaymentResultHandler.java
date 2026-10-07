@@ -2,7 +2,7 @@ package cz.demo.eda.order.messaging;
 
 import cz.demo.eda.order.domain.OrderService;
 import cz.demo.eda.order.event.PaymentResult;
-import cz.demo.eda.order.inbox.InboxMessage;
+import cz.demo.eda.order.inbox.InboxEntry;
 import cz.demo.eda.order.inbox.InboxMessageHandler;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.json.JsonMapper;
@@ -20,7 +20,7 @@ public class PaymentResultHandler implements InboxMessageHandler {
     }
 
     @Override
-    public void handle(InboxMessage message) {
-        orderService.applyPaymentResult(jsonMapper.readValue(message.payload(), PaymentResult.class));
+    public void handle(InboxEntry entry) {
+        orderService.applyPaymentResult(jsonMapper.readValue(entry.payload(), PaymentResult.class));
     }
 }

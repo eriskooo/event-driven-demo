@@ -69,10 +69,29 @@ flowchart LR
 | Kafka doručuje „at least once“ – stejná zpráva může přijít vícekrát | **Inbox**: PK `event_id` – duplicita se pozná při `INSERT … ON CONFLICT DO NOTHING`. |
 | Dlouhé/opakované zpracování blokuje partition a hrozí rebalance | Listener jen uloží zprávu do inboxu a hned potvrdí offset; zpracování s retry běží mimo poll loop. |
 | Retry s backoffem musí přežít restart podu | Stav retry (`attempts`, `next_attempt_at`, `last_error`) je v DB. |
-| Při chybě se nesmí zapsat „půlka“ změn | `InboxProcessor` spouští handler v savepointu (`PROPAGATION_NESTED`) – při chybě se vrátí jen jeho změny a ve stejné transakci se zapíše plán dalšího pokusu nebo DLT. |
+| Při chybě se nesmí zapsat „půlka“ změn | Zpracování zprávy (doménová změna + outbox + stav inboxu) je jedna transakce `InboxService.process` – chyba ji celou vrátí. Plánovač pak v nové transakci `InboxService.recordFailure` zapíše retry nebo `FAILED` + DLT. |
 
-Relay i processor zamykají řádky přes `SELECT … FOR UPDATE SKIP LOCKED`, takže služby lze škálovat
-na víc replik bez dvojího zpracování.
+Relay i processor zamykají řádky přes `SELECT … FOR UPDATE SKIP LOCKED` (JPA `@Lock(PESSIMISTIC_WRITE)`
++ hint `jakarta.persistence.lock.timeout = -2`), takže služby lze škálovat na víc replik bez dvojího
+zpracování. Mezi neúspěšnou transakcí zpracování a zápisem retry není zpráva zamčená – jiná replika si
+ji v tu chvíli může vzít; nejhorší důsledek je pokus navíc, který pokryje idempotence.
+
+### Perzistence a transakce
+
+- **JPA** (Spring Data JPA, Hibernate 7) – entity `Order`, `Payment`, `InboxEntry`, `OutboxEntry`;
+  přechody stavů jen přes metody entit, ukládání dirty checkingem. Schéma spravuje Flyway,
+  Hibernate ho jen validuje (`ddl-auto=validate`). JSONB sloupce přes `@JdbcTypeCode(SqlTypes.JSON)`.
+- **Transakce jen deklarativně:** servisy (`@Service`) mají `@Transactional` nad třídou (čtecí metody
+  `readOnly`), repozitáře `@Transactional(readOnly = true)` nad rozhraním. Žádné programové transakce.
+- Plánovače a listenery transakce neřídí – volají transakční servisy:
+
+| Netransakční (spouštěč) | Transakční servisa | Co dělá jedna transakce |
+|---|---|---|
+| `InboxProcessor` (`@Scheduled`) | `InboxService` | `process(id)`: handler + `PROCESSED`; `recordFailure(id)`: retry / `FAILED` + DLT |
+| `OutboxRelay` (`@Scheduled`) | `OutboxService` | `publishBatch()`: zamknout dávku, odeslat, označit `published_at` |
+| `RetentionCleanup` (`@Scheduled`) | `CleanupService` | smazat jednu dávku starých řádků |
+| `*Listener` (`@KafkaListener`) | `InboxService.store` | uložit zprávu do inboxu (duplicita → `false`) |
+| `OrderController` | `OrderService` | uložit objednávku + `OrderCreated` do outboxu |
 
 **Úklid:** `cleanup/RetentionCleanup` (v každé službě nad jejím schématem) jednou denně smaže
 dokončené zprávy z inboxu (`PROCESSED`, `FAILED`) a publikované zprávy z outboxu starší než
@@ -134,7 +153,7 @@ Ověřené jako aktuální stabilní k 2026-10-07:
 | Komponenta | Verze |
 |---|---|
 | Java | 21 (image `eclipse-temurin:21-jre-noble`) |
-| Spring Boot | 4.1.1 (Spring Kafka 4.1.1, Kafka klient 4.2.1, Flyway 12.4, PostgreSQL JDBC 42.7.13) |
+| Spring Boot | 4.1.1 (Spring Kafka 4.1.1, Kafka klient 4.2.1, Spring Data JPA + Hibernate 7.4, Flyway 12.4, PostgreSQL driver 42.7.13) |
 | Apache Kafka | `apache/kafka:4.3.1` (KRaft) |
 | PostgreSQL | `postgres:18.6-alpine` |
 | Testcontainers | 2.0.5 |
@@ -321,13 +340,14 @@ scripts/                  build-images, deploy, teardown, port-forward, send-ord
 
 | Ověřeno | Jak |
 |---|---|
-| Unit, repository a integrační testy | `mvn clean install` – 157 testů (order 80, payment 77), 0 selhání; Testcontainers `postgres:18.6-alpine` + `apache/kafka:4.3.1` |
+| Unit, repository a integrační testy | `mvn clean install` – 187 testů (order 94, payment 93), 0 selhání; repository testy `@DataJpaTest` proti PostgreSQL; Testcontainers `postgres:18.6-alpine` + `apache/kafka:4.3.1` |
 | Deploy profilu `base` | Kubernetes v Docker Desktopu (v1.32): Kafka, PostgreSQL, obě služby Ready za ~30 s, 0 restartů |
 | E2E tok | 9 objednávek: 7× `PAID`, 1× `PAYMENT_FAILED` (simulované zamítnutí), poison 666 zůstala `PENDING_PAYMENT` |
 | Inbox/outbox v DB | všechny outbox řádky publikované; inboxy `PROCESSED`; poison zpráva `FAILED` po 4 pokusech s chybou v `last_error`, její DLT zpráva odeslaná |
 | Izolace schémat | `order_service` na `payments.payments` → `permission denied for schema payments` |
 | Flyway migrace nad existující DB | V2 (indexy pro úklid) se aplikovala při redeployi |
-| Úklid | po zestárnutí 4+4 řádků o 8 dní a cronu každou minutu smazáno přesně 4 inbox + 4 outbox v každé službě, čerstvé řádky zůstaly |
+| Úklid | po zestárnutí 4+4 řádků o 8 dní a cronu každou minutu smazáno přesně 4 inbox + 4 outbox v každé službě, čerstvé řádky zůstaly (ověřeno na JDBC verzi; JPA verze pokrytá testy) |
+| JPA verze v clusteru | Hibernate validace schématu proti DB z Flyway prošla; 9 objednávek: 6× `PAID`, 2× `PAYMENT_FAILED`, poison `FAILED` po 4 pokusech → DLT, žádná platba po rollbacku, outbox prázdný |
 
 Profily `monitoring`, `logging` a `full` jsou po restrukturalizaci ověřené jen renderem
 (`kubectl kustomize`); v předchozí verzi projektu (bez DB) byl plný stack nasazený a ověřený E2E.

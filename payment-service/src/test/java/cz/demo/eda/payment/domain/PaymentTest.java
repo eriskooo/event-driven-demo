@@ -20,7 +20,7 @@ class PaymentTest {
     @Test
     @DisplayName("Úspěšná platba převezme paymentId z výsledku a částku z objednávky")
     void should_buildCompletedPayment_whenResultCompleted() {
-        var payment = Payment.of(ORDER, PaymentCompleted.of("c", "o-1", "p-1", ORDER.amount()), NOW);
+        Payment payment = Payment.of(ORDER, PaymentCompleted.of("c", "o-1", "p-1", ORDER.amount()), NOW);
 
         assertThat(payment.id()).isEqualTo("p-1");
         assertThat(payment.status()).isEqualTo(PaymentStatus.COMPLETED);
@@ -28,12 +28,13 @@ class PaymentTest {
         assertThat(payment.currency()).isEqualTo("EUR");
         assertThat(payment.failureReason()).isNull();
         assertThat(payment.createdAt()).isEqualTo(NOW);
+        assertThat(payment.isNew()).isTrue();
     }
 
     @Test
     @DisplayName("Zamítnutá platba dostane nové ID a důvod zamítnutí")
     void should_buildFailedPayment_whenResultFailed() {
-        var payment = Payment.of(ORDER, PaymentFailed.of("c", "o-1", "declined"), NOW);
+        Payment payment = Payment.of(ORDER, PaymentFailed.of("c", "o-1", "declined"), NOW);
 
         assertThat(payment.id()).isNotBlank();
         assertThat(payment.status()).isEqualTo(PaymentStatus.FAILED);
@@ -45,5 +46,14 @@ class PaymentTest {
     void should_throw_whenOrderIdIsNull() {
         assertThatNullPointerException().isThrownBy(() ->
                 new Payment("p", null, PaymentStatus.COMPLETED, BigDecimal.ONE, "CZK", null, NOW));
+    }
+
+    @Test
+    @DisplayName("Rovnost plateb je dána ID")
+    void should_beEqual_whenIdsMatch() {
+        Payment first = new Payment("p-1", "o-1", PaymentStatus.COMPLETED, BigDecimal.ONE, "CZK", null, NOW);
+        Payment second = new Payment("p-1", "o-2", PaymentStatus.FAILED, BigDecimal.TEN, "EUR", "x", NOW);
+
+        assertThat(first).isEqualTo(second).hasSameHashCodeAs(second);
     }
 }

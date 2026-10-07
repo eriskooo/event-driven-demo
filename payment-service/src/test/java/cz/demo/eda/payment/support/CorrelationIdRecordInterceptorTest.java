@@ -22,10 +22,10 @@ class CorrelationIdRecordInterceptorTest {
     @Test
     @DisplayName("Vloží correlationId z hlavičky do MDC a po zpracování ho odstraní")
     void should_putAndRemoveMdc_whenHeaderPresent() {
-        var record = new ConsumerRecord<Object, Object>("t", 0, 0, "k", "v");
+        ConsumerRecord<Object, Object> record = new ConsumerRecord<Object, Object>("t", 0, 0, "k", "v");
         record.headers().add(Tracing.CORRELATION_ID_HEADER, "corr-9".getBytes(StandardCharsets.UTF_8));
 
-        var returned = interceptor.intercept(record, null);
+        ConsumerRecord<Object, Object> returned = interceptor.intercept(record, null);
 
         assertThat(returned).isSameAs(record);
         assertThat(MDC.get(Tracing.CORRELATION_ID_MDC_KEY)).isEqualTo("corr-9");
@@ -36,7 +36,7 @@ class CorrelationIdRecordInterceptorTest {
     @Test
     @DisplayName("Bez hlavičky MDC nezmění")
     void should_leaveMdcEmpty_whenHeaderMissing() {
-        var record = new ConsumerRecord<Object, Object>("t", 0, 0, "k", "v");
+        ConsumerRecord<Object, Object> record = new ConsumerRecord<Object, Object>("t", 0, 0, "k", "v");
 
         interceptor.intercept(record, null);
 

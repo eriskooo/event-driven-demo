@@ -6,6 +6,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
@@ -45,7 +46,7 @@ public final class KafkaTestSupport {
                 ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
                 ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
                 ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        try (var producer = new KafkaProducer<String, String>(props)) {
+        try (KafkaProducer<String, String> producer = new KafkaProducer<String, String>(props)) {
             producer.send(new ProducerRecord<>(topic, key, value)).get();
         } catch (Exception e) {
             throw new IllegalStateException("Failed to send raw record to " + topic, e);
@@ -54,7 +55,7 @@ public final class KafkaTestSupport {
 
     /** Vrátí hodnotu hlavičky jako text, nebo null. */
     public static String header(ConsumerRecord<?, ?> record, String name) {
-        var header = record.headers().lastHeader(name);
+        Header header = record.headers().lastHeader(name);
         return header == null ? null : new String(header.value(), StandardCharsets.UTF_8);
     }
 
@@ -67,12 +68,12 @@ public final class KafkaTestSupport {
                 ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
                 ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
                 ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        var found = new ArrayList<ConsumerRecord<String, String>>();
-        var deadline = Instant.now().plus(duration);
-        try (var consumer = new KafkaConsumer<String, String>(props)) {
+        List<ConsumerRecord<String, String>> found = new ArrayList<ConsumerRecord<String, String>>();
+        Instant deadline = Instant.now().plus(duration);
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<String, String>(props)) {
             consumer.subscribe(List.of(topic));
             while (Instant.now().isBefore(deadline)) {
-                for (var record : consumer.poll(Duration.ofMillis(200))) {
+                for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofMillis(200))) {
                     if (match.test(record)) {
                         found.add(record);
                     }

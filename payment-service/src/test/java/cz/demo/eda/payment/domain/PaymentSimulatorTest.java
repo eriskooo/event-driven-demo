@@ -3,6 +3,7 @@ package cz.demo.eda.payment.domain;
 import cz.demo.eda.payment.event.OrderCreated;
 import cz.demo.eda.payment.event.PaymentCompleted;
 import cz.demo.eda.payment.event.PaymentFailed;
+import cz.demo.eda.payment.event.PaymentResult;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -21,10 +22,10 @@ class PaymentSimulatorTest {
     @Test
     @DisplayName("Při failure-rate 0 platba vždy projde a nese correlationId i částku")
     void should_complete_whenFailureRateIsZero() {
-        var simulator = simulator(0.0, 0.0);
-        var order = order("10.00");
+        PaymentSimulator simulator = simulator(0.0, 0.0);
+        OrderCreated order = order("10.00");
 
-        var result = simulator.process(order);
+        PaymentResult result = simulator.process(order);
 
         assertThat(result).isInstanceOfSatisfying(PaymentCompleted.class, completed -> {
             assertThat(completed.orderId()).isEqualTo(order.orderId());
@@ -37,7 +38,7 @@ class PaymentSimulatorTest {
     @Test
     @DisplayName("Při failure-rate 1 platba vždy selže")
     void should_fail_whenFailureRateIsOne() {
-        var result = simulator(1.0, 0.999).process(order("10.00"));
+        PaymentResult result = simulator(1.0, 0.999).process(order("10.00"));
 
         assertThat(result).isInstanceOfSatisfying(PaymentFailed.class,
                 failed -> assertThat(failed.reason()).isEqualTo(PaymentSimulator.DECLINED_REASON));
@@ -47,7 +48,7 @@ class PaymentSimulatorTest {
     @CsvSource({"0.2, 0.19, true", "0.2, 0.2, false", "0.2, 0.0, true", "0.0, 0.0, false"})
     @DisplayName("Hranice failure-rate: selže jen když náhodná hodnota je ostře menší")
     void should_respectBoundary_whenRandomNearFailureRate(double rate, double randomValue, boolean expectFailure) {
-        var result = simulator(rate, randomValue).process(order("1"));
+        PaymentResult result = simulator(rate, randomValue).process(order("1"));
 
         assertThat(result instanceof PaymentFailed).isEqualTo(expectFailure);
     }
@@ -55,7 +56,7 @@ class PaymentSimulatorTest {
     @Test
     @DisplayName("Poison částka vyvolá technickou výjimku bez ohledu na scale")
     void should_throw_whenAmountIsPoison() {
-        var simulator = simulator(0.0, 0.0);
+        PaymentSimulator simulator = simulator(0.0, 0.0);
 
         assertThatThrownBy(() -> simulator.process(order("666.00")))
                 .isInstanceOf(PaymentProcessingException.class)

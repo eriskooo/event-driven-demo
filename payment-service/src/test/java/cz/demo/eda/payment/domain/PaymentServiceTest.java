@@ -45,43 +45,46 @@ class PaymentServiceTest {
     @Test
     @DisplayName("Úspěšnou platbu uloží a výsledek zařadí do outboxu payments.result")
     void should_saveAndPublish_whenPaymentCompleted() {
-        var order = order("10.00");
-        var result = PaymentCompleted.of("c", "o-1", "p-1", order.amount());
+        OrderCreated order = order("10.00");
+        PaymentCompleted result = PaymentCompleted.of("c", "o-1", "p-1", order.amount());
         when(simulator.process(order)).thenReturn(result);
 
         assertThat(service.processPayment(order)).isEqualTo(result);
 
-        var saved = ArgumentCaptor.forClass(Payment.class);
-        verify(repository).save(saved.capture());
-        assertThat(saved.getValue().status()).isEqualTo(PaymentStatus.COMPLETED);
-        assertThat(saved.getValue().createdAt()).isEqualTo(NOW);
+        Payment saved = captureSaved();
+        assertThat(saved.status()).isEqualTo(PaymentStatus.COMPLETED);
+        assertThat(saved.createdAt()).isEqualTo(NOW);
         verify(outbox).publish("payments.result", result);
     }
 
     @Test
     @DisplayName("Zamítnutou platbu také uloží a publikuje PaymentFailed")
     void should_saveAndPublish_whenPaymentDeclined() {
-        var order = order("10.00");
-        var result = PaymentFailed.of("c", "o-1", "declined");
+        OrderCreated order = order("10.00");
+        PaymentFailed result = PaymentFailed.of("c", "o-1", "declined");
         when(simulator.process(order)).thenReturn(result);
 
         service.processPayment(order);
 
-        var saved = ArgumentCaptor.forClass(Payment.class);
-        verify(repository).save(saved.capture());
-        assertThat(saved.getValue().status()).isEqualTo(PaymentStatus.FAILED);
+        assertThat(captureSaved().status()).isEqualTo(PaymentStatus.FAILED);
         verify(outbox).publish("payments.result", result);
     }
 
     @Test
     @DisplayName("Technická chyba simulace nic neuloží ani nepublikuje")
     void should_propagate_whenSimulatorFails() {
-        var order = order("666");
+        OrderCreated order = order("666");
         when(simulator.process(order)).thenThrow(new PaymentProcessingException("boom"));
 
         assertThatThrownBy(() -> service.processPayment(order)).isInstanceOf(PaymentProcessingException.class);
 
         verifyNoInteractions(repository, outbox);
+    }
+
+    private Payment captureSaved() {
+        ArgumentCaptor<Payment> captor = ArgumentCaptor.forClass(Payment.class);
+        verify(repository).save(captor.capture());
+        return captor.getValue();
     }
 
     private static OrderCreated order(String amount) {

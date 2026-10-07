@@ -4,12 +4,16 @@ import cz.demo.eda.order.domain.Order;
 import cz.demo.eda.order.domain.OrderRepository;
 import cz.demo.eda.order.domain.OrderStatus;
 import cz.demo.eda.order.event.PaymentCompleted;
+import cz.demo.eda.order.inbox.InboxEntry;
 import cz.demo.eda.order.inbox.InboxRepository;
+import cz.demo.eda.order.inbox.InboxStatus;
 import cz.demo.eda.order.outbox.OutboxRepository;
 import cz.demo.eda.order.support.MessagingMetrics;
 import cz.demo.eda.order.support.Topics;
 import cz.demo.eda.order.support.Tracing;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -22,6 +26,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.kafka.KafkaContainer;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.math.BigDecimal;
@@ -64,28 +69,28 @@ class OrderServiceIntegrationTest {
     @Test
     @DisplayName("Objednávka jde přes outbox do orders.created a PaymentCompleted ji přes inbox převede na PAID právě jednou")
     void should_completeOrder_whenPaymentCompletedReceived() throws Exception {
-        var body = mvc.perform(post("/orders")
+        String body = mvc.perform(post("/orders")
                         .header(Tracing.CORRELATION_ID_HEADER, "it-corr-1")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"customerId":"cust-it","amount":42.00,"currency":"CZK"}"""))
                 .andExpect(status().isCreated())
                 .andReturn().getResponse().getContentAsString();
-        var orderId = jsonMapper.readTree(body).get("id").asString();
+        String orderId = jsonMapper.readTree(body).get("id").asString();
 
-        var published = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.ORDERS_CREATED,
+        ConsumerRecord<String, String> published = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.ORDERS_CREATED,
                 r -> orderId.equals(r.key()), TIMEOUT);
-        var event = jsonMapper.readTree(published.value());
+        JsonNode event = jsonMapper.readTree(published.value());
         assertThat(event.get("orderId").asString()).isEqualTo(orderId);
         assertThat(event.get("correlationId").asString()).isEqualTo("it-corr-1");
         assertThat(KafkaTestSupport.header(published, Tracing.CORRELATION_ID_HEADER)).isEqualTo("it-corr-1");
-        await().atMost(TIMEOUT).until(() -> outbox.countUnpublished() == 0);
+        await().atMost(TIMEOUT).until(() -> outbox.countByPublishedAtIsNull() == 0);
 
-        var payment = PaymentCompleted.of("it-corr-1", orderId, "pay-1", new BigDecimal("42.00"));
+        PaymentCompleted payment = PaymentCompleted.of("it-corr-1", orderId, "pay-1", new BigDecimal("42.00"));
         sendPaymentResult(payment);
         await().atMost(TIMEOUT).untilAsserted(() ->
                 assertThat(orders.findById(orderId)).get().extracting(Order::status).isEqualTo(OrderStatus.PAID));
-        assertThat(inbox.findStatus(payment.eventId())).contains("PROCESSED");
+        assertThat(inbox.findById(payment.eventId())).get().extracting(InboxEntry::status).isEqualTo(InboxStatus.PROCESSED);
 
         // Stejná událost podruhé (at-least-once doručení) – inbox ji rozpozná jako duplicitu.
         sendPaymentResult(payment);
@@ -98,7 +103,7 @@ class OrderServiceIntegrationTest {
     void should_moveToDlt_whenPaymentResultUnreadable() {
         KafkaTestSupport.sendRaw(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT, "bad-1", "this is not json");
 
-        var dead = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.dltOf(Topics.PAYMENTS_RESULT),
+        ConsumerRecord<String, String> dead = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.dltOf(Topics.PAYMENTS_RESULT),
                 r -> "bad-1".equals(r.key()), TIMEOUT);
 
         assertThat(dead.value()).isEqualTo("this is not json");
@@ -108,13 +113,13 @@ class OrderServiceIntegrationTest {
     }
 
     private void sendPaymentResult(PaymentCompleted payment) throws Exception {
-        var record = new ProducerRecord<Object, Object>(Topics.PAYMENTS_RESULT, payment.orderId(), payment);
+        ProducerRecord<Object, Object> record = new ProducerRecord<Object, Object>(Topics.PAYMENTS_RESULT, payment.orderId(), payment);
         record.headers().add(Tracing.CORRELATION_ID_HEADER, payment.correlationId().getBytes(StandardCharsets.UTF_8));
         kafkaTemplate.send(record).get();
     }
 
     private double counter(String name, String tagKey, String tagValue) {
-        var counter = registry.find(name).tag(tagKey, tagValue).counter();
+        Counter counter = registry.find(name).tag(tagKey, tagValue).counter();
         return counter == null ? 0 : counter.count();
     }
 }

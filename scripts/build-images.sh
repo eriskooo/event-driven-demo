@@ -10,7 +10,9 @@ CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
 
 for service in order-service payment-service; do
   echo ">> Building ${service}:${TAG}"
-  docker build -t "${service}:${TAG}" "${ROOT}/${service}"
+  # Build z adresáře služby s kontextem "." – absolutní cesta /c/... by v Git Bash s MSYS_NO_PATHCONV=1
+  # pro Windows docker.exe neexistovala.
+  (cd "${ROOT}/${service}" && docker build -t "${service}:${TAG}" .)
   if [[ "${CONTEXT}" == "docker-desktop" ]]; then
     continue
   fi

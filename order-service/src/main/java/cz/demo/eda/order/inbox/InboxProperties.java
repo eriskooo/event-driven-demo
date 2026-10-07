@@ -24,7 +24,7 @@ public record InboxProperties(
 
     /** Vrátí prodlevu před dalším pokusem po {@code failedAttempts} neúspěšných pokusech. */
     public Duration backoffAfter(int failedAttempts) {
-        var millis = initialBackoff.toMillis() * Math.pow(multiplier, Math.max(0, failedAttempts - 1));
+        double millis = initialBackoff.toMillis() * Math.pow(multiplier, Math.max(0, failedAttempts - 1));
         return Duration.ofMillis((long) Math.min(millis, maxBackoff.toMillis()));
     }
 }

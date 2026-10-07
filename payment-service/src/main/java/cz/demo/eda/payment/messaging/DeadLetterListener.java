@@ -3,6 +3,7 @@ package cz.demo.eda.payment.messaging;
 import cz.demo.eda.payment.outbox.OutboxPublisher;
 import cz.demo.eda.payment.support.Topics;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,7 +29,7 @@ public class DeadLetterListener {
     @KafkaListener(id = "order-created-dlt-listener", idIsGroup = false, topics = DLT_TOPIC, groupId = "payment-service-dlt",
             properties = "value.deserializer=org.apache.kafka.common.serialization.StringDeserializer")
     public void onDeadLetter(ConsumerRecord<String, String> record, Acknowledgment ack) {
-        var headers = record.headers();
+        Headers headers = record.headers();
         log.error("Dead letter received: key={} originalTopic={} exception={} message={} attempts={} payload={}",
                 record.key(),
                 header(headers, KafkaHeaders.DLT_ORIGINAL_TOPIC, OutboxPublisher.DLT_ORIGINAL_TOPIC),
@@ -40,8 +41,8 @@ public class DeadLetterListener {
 
     /** Vrátí text první nalezené hlavičky z uvedených jmen, nebo null. */
     static String header(Headers headers, String... names) {
-        for (var name : names) {
-            var header = headers.lastHeader(name);
+        for (String name : names) {
+            Header header = headers.lastHeader(name);
             if (header != null && header.value() != null) {
                 return new String(header.value(), StandardCharsets.UTF_8);
             }

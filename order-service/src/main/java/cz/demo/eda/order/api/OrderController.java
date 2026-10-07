@@ -1,5 +1,6 @@
 package cz.demo.eda.order.api;
 
+import cz.demo.eda.order.domain.Order;
 import cz.demo.eda.order.support.Tracing;
 import cz.demo.eda.order.domain.OrderService;
 import jakarta.validation.Valid;
@@ -12,6 +13,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
+
+import java.net.URI;
 
 /** REST API pro zakládání a dotazování objednávek. */
 @RestController
@@ -27,9 +30,9 @@ public class OrderController {
     /** Založí objednávku; platba proběhne asynchronně, proto vrací stav PENDING_PAYMENT. */
     @PostMapping
     public ResponseEntity<OrderResponse> create(@Valid @RequestBody CreateOrderRequest request) {
-        var order = orderService.createOrder(request.customerId(), request.amount(), request.currency(),
+        Order order = orderService.createOrder(request.customerId(), request.amount(), request.currency(),
                 MDC.get(Tracing.CORRELATION_ID_MDC_KEY));
-        var location = ServletUriComponentsBuilder.fromCurrentRequest().path("/{id}").buildAndExpand(order.id()).toUri();
+        URI location = ServletUriComponentsBuilder.fromCurrentRequest().path("/{id}").buildAndExpand(order.id()).toUri();
         return ResponseEntity.created(location).body(OrderResponse.from(order));
     }
 

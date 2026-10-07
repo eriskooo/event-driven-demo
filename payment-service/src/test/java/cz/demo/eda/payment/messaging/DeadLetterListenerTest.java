@@ -20,10 +20,10 @@ class DeadLetterListenerTest {
     @Test
     @DisplayName("Zprávu z DLT zaloguje a potvrdí")
     void should_acknowledge_whenDeadLetterReceived() {
-        var record = new ConsumerRecord<String, String>("orders.created.DLT", 0, 0, "o-1", "{}");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>("orders.created.DLT", 0, 0, "o-1", "{}");
         record.headers().add(KafkaHeaders.DLT_EXCEPTION_MESSAGE, "boom".getBytes(StandardCharsets.UTF_8));
         record.headers().add(KafkaHeaders.DLT_ORIGINAL_OFFSET, ByteBuffer.allocate(Long.BYTES).putLong(7).array());
-        var ack = mock(Acknowledgment.class);
+        Acknowledgment ack = mock(Acknowledgment.class);
 
         listener.onDeadLetter(record, ack);
 
@@ -33,8 +33,8 @@ class DeadLetterListenerTest {
     @Test
     @DisplayName("Zprávu bez DLT hlaviček a s null hodnotou zpracuje bez chyby")
     void should_acknowledge_whenHeadersAndValueMissing() {
-        var record = new ConsumerRecord<String, String>("orders.created.DLT", 0, 0, null, null);
-        var ack = mock(Acknowledgment.class);
+        ConsumerRecord<String, String> record = new ConsumerRecord<>("orders.created.DLT", 0, 0, null, null);
+        Acknowledgment ack = mock(Acknowledgment.class);
 
         listener.onDeadLetter(record, ack);
 
@@ -44,7 +44,7 @@ class DeadLetterListenerTest {
     @Test
     @DisplayName("Vrátí text hlavičky, nebo null když chybí")
     void should_readHeaderAsText_whenPresent() {
-        var record = new ConsumerRecord<String, String>("t", 0, 0, "k", "v");
+        ConsumerRecord<String, String> record = new ConsumerRecord<>("t", 0, 0, "k", "v");
         record.headers().add("h", "value".getBytes(StandardCharsets.UTF_8));
 
         assertThat(DeadLetterListener.header(record.headers(), "h")).isEqualTo("value");

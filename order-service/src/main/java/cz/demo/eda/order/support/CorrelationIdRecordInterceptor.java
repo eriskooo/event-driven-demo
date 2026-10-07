@@ -2,6 +2,7 @@ package cz.demo.eda.order.support;
 
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.Header;
 import org.slf4j.MDC;
 import org.springframework.kafka.listener.RecordInterceptor;
 import org.springframework.stereotype.Component;
@@ -14,7 +15,7 @@ public class CorrelationIdRecordInterceptor implements RecordInterceptor<Object,
 
     @Override
     public ConsumerRecord<Object, Object> intercept(ConsumerRecord<Object, Object> record, Consumer<Object, Object> consumer) {
-        var header = record.headers().lastHeader(Tracing.CORRELATION_ID_HEADER);
+        Header header = record.headers().lastHeader(Tracing.CORRELATION_ID_HEADER);
         if (header != null && header.value() != null) {
             MDC.put(Tracing.CORRELATION_ID_MDC_KEY, new String(header.value(), StandardCharsets.UTF_8));
         }

@@ -5,5 +5,5 @@ package cz.demo.eda.payment.inbox;
 public interface InboxMessageHandler {
 
     /** Zpracuje zprávu (doménová změna + případné odchozí zprávy do outboxu). */
-    void handle(InboxMessage message);
+    void handle(InboxEntry entry);
 }

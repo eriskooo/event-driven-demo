@@ -1,18 +1,25 @@
 package cz.demo.eda.payment;
 
+import cz.demo.eda.payment.domain.Payment;
 import cz.demo.eda.payment.domain.PaymentRepository;
 import cz.demo.eda.payment.domain.PaymentSimulator;
 import cz.demo.eda.payment.domain.PaymentStatus;
 import cz.demo.eda.payment.event.OrderCreated;
+import cz.demo.eda.payment.inbox.InboxEntry;
 import cz.demo.eda.payment.inbox.InboxRepository;
+import cz.demo.eda.payment.inbox.InboxStatus;
 import cz.demo.eda.payment.outbox.OutboxPublisher;
 import cz.demo.eda.payment.support.MessagingMetrics;
 import cz.demo.eda.payment.support.Topics;
 import cz.demo.eda.payment.support.Tracing;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.ListOffsetsResult;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.DisplayName;
@@ -23,6 +30,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.testcontainers.kafka.KafkaContainer;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.math.BigDecimal;
@@ -69,49 +77,50 @@ class PaymentServiceIntegrationTest {
     @Test
     @DisplayName("OrderCreated přes inbox a outbox vede k PaymentCompleted se stejným orderId a correlationId")
     void should_publishPaymentCompleted_whenOrderCreated() throws Exception {
-        var order = OrderCreated.of("it-corr-2", "order-ok", "cust", new BigDecimal("15.00"), "CZK");
+        OrderCreated order = OrderCreated.of("it-corr-2", "order-ok", "cust", new BigDecimal("15.00"), "CZK");
 
         send(order);
 
-        var result = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT,
-                r -> "order-ok".equals(r.key()), TIMEOUT);
-        var json = jsonMapper.readTree(result.value());
+        ConsumerRecord<String, String> result = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(),
+                Topics.PAYMENTS_RESULT, r -> "order-ok".equals(r.key()), TIMEOUT);
+        JsonNode json = jsonMapper.readTree(result.value());
         assertThat(json.get("type").asString()).isEqualTo("PaymentCompleted");
         assertThat(json.get("correlationId").asString()).isEqualTo("it-corr-2");
         assertThat(KafkaTestSupport.header(result, Tracing.CORRELATION_ID_HEADER)).isEqualTo("it-corr-2");
-        assertThat(payments.findByOrderId("order-ok")).get().extracting(p -> p.status()).isEqualTo(PaymentStatus.COMPLETED);
-        assertThat(inbox.findStatus(order.eventId())).contains("PROCESSED");
+        assertThat(payments.findByOrderId("order-ok")).get().extracting(Payment::status).isEqualTo(PaymentStatus.COMPLETED);
+        assertThat(inboxStatus(order)).isEqualTo(InboxStatus.PROCESSED);
     }
 
     @Test
     @DisplayName("Duplicitní OrderCreated vytvoří jen jeden výsledek platby")
     void should_publishSingleResult_whenOrderCreatedDeliveredTwice() throws Exception {
-        var order = OrderCreated.of("it-corr-3", "order-dup", "cust", BigDecimal.TEN, "CZK");
+        OrderCreated order = OrderCreated.of("it-corr-3", "order-dup", "cust", BigDecimal.TEN, "CZK");
 
         send(order);
         send(order);
 
         await().atMost(TIMEOUT).until(() -> counter(MessagingMetrics.CONSUMED, "outcome", "duplicate") >= 1);
-        var results = KafkaTestSupport.collectRecords(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT,
-                r -> "order-dup".equals(r.key()), Duration.ofSeconds(3));
+        List<ConsumerRecord<String, String>> results = KafkaTestSupport.collectRecords(kafka.getBootstrapServers(),
+                Topics.PAYMENTS_RESULT, r -> "order-dup".equals(r.key()), Duration.ofSeconds(3));
         assertThat(results).hasSize(1);
     }
 
     @Test
     @DisplayName("Poison objednávka se v inboxu zkusí 4krát s backoffem, skončí v DLT a offset je hned potvrzený")
     void should_retryInInboxThenDeadLetter_whenAmountIsPoison() throws Exception {
-        var order = OrderCreated.of("it-corr-4", "order-poison", "cust", new BigDecimal("666"), "CZK");
+        OrderCreated order = OrderCreated.of("it-corr-4", "order-poison", "cust", new BigDecimal("666"), "CZK");
 
         send(order);
 
-        var dead = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.dltOf(Topics.ORDERS_CREATED),
-                r -> "order-poison".equals(r.key()), TIMEOUT);
+        ConsumerRecord<String, String> dead = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(),
+                Topics.dltOf(Topics.ORDERS_CREATED), r -> "order-poison".equals(r.key()), TIMEOUT);
         assertThat(jsonMapper.readTree(dead.value()).get("orderId").asString()).isEqualTo("order-poison");
         assertThat(KafkaTestSupport.header(dead, OutboxPublisher.DLT_EXCEPTION_FQCN)).endsWith("PaymentProcessingException");
         assertThat(KafkaTestSupport.header(dead, OutboxPublisher.DLT_ATTEMPTS)).isEqualTo("4");
         assertThat(KafkaTestSupport.header(dead, Tracing.CORRELATION_ID_HEADER)).isEqualTo("it-corr-4");
         verify(simulator, times(4)).process(argThat(o -> "order-poison".equals(o.orderId())));
-        assertThat(inbox.findStatus(order.eventId())).contains("FAILED");
+        assertThat(inboxStatus(order)).isEqualTo(InboxStatus.FAILED);
+        // Rollback neúspěšných pokusů nesmí nechat v DB platbu.
         assertThat(payments.findByOrderId("order-poison")).isEmpty();
         assertThat(counter(MessagingMetrics.DEAD_LETTERED, "topic", Topics.dltOf(Topics.ORDERS_CREATED))).isEqualTo(1.0);
         await().atMost(TIMEOUT).untilAsserted(() -> assertThat(consumerLag("payment-service")).isZero());
@@ -119,30 +128,35 @@ class PaymentServiceIntegrationTest {
                 r -> "order-poison".equals(r.key()), Duration.ofSeconds(2))).isEmpty();
     }
 
+    private InboxStatus inboxStatus(OrderCreated order) {
+        return inbox.findById(order.eventId()).map(InboxEntry::status).orElseThrow();
+    }
+
     private void send(OrderCreated order) throws Exception {
-        var record = new ProducerRecord<Object, Object>(Topics.ORDERS_CREATED, order.orderId(), order);
+        ProducerRecord<Object, Object> record = new ProducerRecord<>(Topics.ORDERS_CREATED, order.orderId(), order);
         record.headers().add(Tracing.CORRELATION_ID_HEADER, order.correlationId().getBytes(StandardCharsets.UTF_8));
         kafkaTemplate.send(record).get();
     }
 
     private double counter(String name, String tagKey, String tagValue) {
-        var counter = registry.find(name).tag(tagKey, tagValue).counter();
+        Counter counter = registry.find(name).tag(tagKey, tagValue).counter();
         return counter == null ? 0 : counter.count();
     }
 
     /** Součet rozdílů mezi koncem partitions a commitnutým offsetem consumer group. */
     private long consumerLag(String groupId) throws Exception {
-        try (var admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers()))) {
-            var committed = admin.listConsumerGroupOffsets(groupId).partitionsToOffsetAndMetadata().get();
-            var partitions = admin.describeTopics(List.of(Topics.ORDERS_CREATED)).allTopicNames().get()
-                    .get(Topics.ORDERS_CREATED).partitions().stream()
+        try (Admin admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers()))) {
+            Map<TopicPartition, OffsetAndMetadata> committed =
+                    admin.listConsumerGroupOffsets(groupId).partitionsToOffsetAndMetadata().get();
+            Map<TopicPartition, OffsetSpec> partitions = admin.describeTopics(List.of(Topics.ORDERS_CREATED))
+                    .allTopicNames().get().get(Topics.ORDERS_CREATED).partitions().stream()
                     .map(p -> new TopicPartition(Topics.ORDERS_CREATED, p.partition()))
                     .collect(Collectors.toMap(Function.identity(), tp -> OffsetSpec.latest()));
-            var ends = admin.listOffsets(partitions).all().get();
+            Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> ends = admin.listOffsets(partitions).all().get();
             // Partition bez commitu vrací Admin API jako klíč s hodnotou null.
             return ends.entrySet().stream()
                     .mapToLong(e -> {
-                        var offset = committed.get(e.getKey());
+                        OffsetAndMetadata offset = committed.get(e.getKey());
                         return e.getValue().offset() - (offset == null ? 0 : offset.offset());
                     })
                     .sum();

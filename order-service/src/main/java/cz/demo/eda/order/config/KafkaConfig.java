@@ -35,7 +35,7 @@ public class KafkaConfig {
      */
     @Bean
     KafkaAdmin.NewTopics edaTopics(EdaKafkaProperties properties) {
-        var settings = properties.topics();
+        EdaKafkaProperties.Topics settings = properties.topics();
         return new KafkaAdmin.NewTopics(
                 topic(Topics.ORDERS_CREATED, settings),
                 topic(Topics.PAYMENTS_RESULT, settings),
@@ -49,8 +49,8 @@ public class KafkaConfig {
                                           ProducerFactory<Object, Object> producerFactory,
                                           EdaKafkaProperties properties, MessagingMetrics metrics) {
         metrics.deadLetterCounter(Topics.dltOf(Topics.PAYMENTS_RESULT));
-        var recoverer = deadLetterRecoverer(kafkaTemplate, producerFactory);
-        var handler = new DefaultErrorHandler((record, ex) -> {
+        DeadLetterPublishingRecoverer recoverer = deadLetterRecoverer(kafkaTemplate, producerFactory);
+        DefaultErrorHandler handler = new DefaultErrorHandler((record, ex) -> {
             recoverer.accept(record, ex);
             metrics.deadLettered(Topics.dltOf(record.topic()));
             log.error("Record {}-{}@{} moved to {} after retries", record.topic(), record.partition(),
@@ -65,7 +65,7 @@ public class KafkaConfig {
                                                                      ProducerFactory<Object, Object> producerFactory) {
         // Nedeserializovatelná zpráva má jako hodnotu původní byte[] – ten musí jít do DLT beze změny,
         // JSON serializer by ho zakódoval do base64.
-        var bytesTemplate = new KafkaTemplate<>(producerFactory,
+        KafkaTemplate<Object, Object> bytesTemplate = new KafkaTemplate<>(producerFactory,
                 Map.of(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class));
         Map<Class<?>, KafkaOperations<?, ?>> templates = new LinkedHashMap<>();
         templates.put(byte[].class, bytesTemplate);
@@ -78,7 +78,7 @@ public class KafkaConfig {
     }
 
     private static ExponentialBackOffWithMaxRetries backOff(EdaKafkaProperties.Retry retry) {
-        var backOff = new ExponentialBackOffWithMaxRetries(retry.maxRetries());
+        ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(retry.maxRetries());
         backOff.setInitialInterval(retry.initialInterval().toMillis());
         backOff.setMultiplier(retry.multiplier());
         backOff.setMaxInterval(retry.maxInterval().toMillis());
