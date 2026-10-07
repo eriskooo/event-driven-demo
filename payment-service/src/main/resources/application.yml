@@ -1,0 +1,81 @@
+spring:
+  application:
+    name: payment-service
+  threads:
+    virtual:
+      enabled: true
+  mvc:
+    problemdetails:
+      enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    admin:
+      # Bez brokeru by se topicy nevytvořily (auto-create je na brokeru vypnutý) – raději spadnout a restartovat.
+      fail-fast: true
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      properties:
+        enable.idempotence: true
+        # Konzument nezávisí na Java třídách producenta – typ určuje sám.
+        spring.json.add.type.headers: false
+    consumer:
+      group-id: payment-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      # ErrorHandlingDeserializer převede nečitelnou zprávu na výjimku, kterou error handler pošle do DLT,
+      # místo nekonečné smyčky v poll().
+      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.value.default.type: cz.demo.eda.payment.event.OrderCreated
+        spring.json.use.type.headers: false
+        spring.json.trusted.packages: cz.demo.eda.payment.event
+    listener:
+      ack-mode: manual_immediate
+      concurrency: 3
+
+payment:
+  failure-rate: ${PAYMENT_FAILURE_RATE:0.2}
+  poison-amount: ${PAYMENT_POISON_AMOUNT:666}
+
+eda:
+  kafka:
+    topics:
+      partitions: 3
+      replicas: 1
+    retry:
+      max-retries: 3
+      initial-interval: 500ms
+      multiplier: 2.0
+      max-interval: 5s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
+logging:
+  structured:
+    format:
+      console: ecs
+    ecs:
+      service:
+        name: ${spring.application.name}

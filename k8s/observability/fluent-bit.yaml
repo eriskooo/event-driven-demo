@@ -1,0 +1,168 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+---
+# Kubernetes filtr potřebuje číst metadata podů (labels) přes API server.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eda-demo-fluent-bit
+rules:
+  - apiGroups: [""]
+    resources: [pods, namespaces]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eda-demo-fluent-bit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eda-demo-fluent-bit
+subjects:
+  - kind: ServiceAccount
+    name: fluent-bit
+    namespace: eda-demo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+data:
+  fluent-bit.yaml: |
+    service:
+      flush: 2
+      log_level: info
+      http_server: on
+      http_listen: 0.0.0.0
+      http_port: 2020
+      health_check: on
+
+    parsers:
+      # Vlastní JSON parser bez Time_Key – čas události nese aplikace v poli @timestamp (ECS).
+      - name: app_json
+        format: json
+
+    pipeline:
+      inputs:
+        - name: tail
+          tag: kube.*
+          # Jen logy našich služeb – infrastruktura (Kafka, ES, ...) nepíše JSON a index by jen zašuměla.
+          path: /var/log/containers/order-service-*_eda-demo_*.log,/var/log/containers/payment-service-*_eda-demo_*.log
+          # Formát souboru závisí na runtime minikube (docker JSON vs. CRI); oba parsery to pokryjí.
+          multiline.parser: docker, cri
+          db: /var/fluent-bit/state/flb_kube.db
+          mem_buf_limit: 16MB
+          skip_long_lines: on
+          refresh_interval: 5
+          read_from_head: true
+
+      filters:
+        - name: kubernetes
+          match: kube.*
+          merge_log: off
+          keep_log: on
+          labels: on
+          annotations: off
+        # Surový řádek přejmenujeme: ECS JSON má vlastní objekt "log" ({level, logger}). Kdyby první
+        # ne-JSON řádek (např. "Picked up JAVA_TOOL_OPTIONS" z JVM) zůstal v "log" jako text,
+        # ES by zafixoval mapování log=text a všechny další ECS záznamy odmítl.
+        - name: modify
+          match: kube.*
+          rename: log raw_log
+        # Řádek aplikace (ECS JSON) rozbalí na top-level pole: message, log.level, correlationId, ...
+        - name: parser
+          match: kube.*
+          key_name: raw_log
+          parser: app_json
+          reserve_data: on
+        # Ne-JSON řádky si ponechají raw_log; zkopírujeme ho do message, aby byly v Kibaně čitelné.
+        - name: modify
+          match: kube.*
+          condition: key_does_not_exist message
+          copy: raw_log message
+
+      outputs:
+        - name: es
+          match: kube.*
+          host: elasticsearch
+          port: 9200
+          logstash_format: on
+          logstash_prefix: eda-logs
+          # @timestamp už je v ECS záznamu; čas ingestu jde do jiného pole, aby nevznikl duplicitní klíč.
+          time_key: ingest_timestamp
+          suppress_type_name: on
+          # Labely typu app.kubernetes.io/name by ES chápal jako vnořené objekty a hlásil konflikty mapování.
+          replace_dots: on
+          trace_error: on
+          retry_limit: 5
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  labels:
+    app.kubernetes.io/name: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fluent-bit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fluent-bit
+    spec:
+      serviceAccountName: fluent-bit
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:5.1.3
+          args: ["-c", "/fluent-bit/etc/custom/fluent-bit.yaml"]
+          ports:
+            - name: http
+              containerPort: 2020
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /fluent-bit/etc/custom
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            # Při docker runtime jsou /var/log/containers/*.log symlinky sem.
+            - name: docker-containers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: state
+              mountPath: /var/fluent-bit/state
+      volumes:
+        - name: config
+          configMap:
+            name: fluent-bit-config
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: docker-containers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: state
+          hostPath:
+            path: /var/fluent-bit/state
+            type: DirectoryOrCreate

@@ -1,0 +1,100 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-service-config
+  labels:
+    app.kubernetes.io/name: order-service
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  # Heap jen 60 % limitu – zbytek potřebuje metaspace, vlákna a direct buffery Kafka klienta.
+  JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60 -XX:+ExitOnOutOfMemoryError
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  labels:
+    app.kubernetes.io/name: order-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: order-service
+        app.kubernetes.io/part-of: eda-demo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "8080"
+    spec:
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # Čeká na broker, aby KafkaAdmin při startu vytvořil topicy a pod neskončil v CrashLoopBackOff.
+        - name: wait-for-kafka
+          image: busybox:1.37.0
+          command: ["sh", "-c", "until nc -z kafka 9092; do echo waiting for kafka; sleep 2; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: order-service
+          image: order-service:dev
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: order-service-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 36
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  labels:
+    app.kubernetes.io/name: order-service
+spec:
+  selector:
+    app.kubernetes.io/name: order-service
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
