@@ -1,0 +1,2 @@
+# Shell skripty musí mít LF i při checkoutu na Windows (core.autocrlf), jinak je bash nespustí.
+*.sh text eol=lf
