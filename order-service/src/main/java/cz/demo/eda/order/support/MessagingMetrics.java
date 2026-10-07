@@ -11,8 +11,16 @@ public class MessagingMetrics {
     public static final String PRODUCED = "eda.messages.produced";
     public static final String CONSUMED = "eda.messages.consumed";
     public static final String DEAD_LETTERED = "eda.messages.dead.lettered";
-    public static final String OUTCOME_PROCESSED = "processed";
+    public static final String INBOX_PROCESSED = "eda.inbox.processed";
+
+    /** Zpráva uložena do inboxu. */
+    public static final String OUTCOME_STORED = "stored";
+    /** Zpráva se stejným eventId už v inboxu byla – přeskočena. */
     public static final String OUTCOME_DUPLICATE = "duplicate";
+
+    public static final String INBOX_SUCCESS = "success";
+    public static final String INBOX_RETRY = "retry";
+    public static final String INBOX_FAILED = "failed";
 
     private final MeterRegistry registry;
 
@@ -20,14 +28,19 @@ public class MessagingMetrics {
         this.registry = registry;
     }
 
-    /** Započítá úspěšně odeslanou zprávu. */
+    /** Započítá zprávu potvrzenou brokerem. */
     public void produced(String topic) {
         Counter.builder(PRODUCED).tag("topic", topic).register(registry).increment();
     }
 
-    /** Započítá přijatou zprávu s výsledkem (processed / duplicate). */
+    /** Započítá přijatou zprávu s výsledkem (stored / duplicate). */
     public void consumed(String topic, String outcome) {
         Counter.builder(CONSUMED).tag("topic", topic).tag("outcome", outcome).register(registry).increment();
+    }
+
+    /** Započítá pokus o zpracování zprávy z inboxu (success / retry / failed). */
+    public void inboxProcessed(String topic, String outcome) {
+        Counter.builder(INBOX_PROCESSED).tag("topic", topic).tag("outcome", outcome).register(registry).increment();
     }
 
     /** Započítá zprávu přesunutou do DLT. */

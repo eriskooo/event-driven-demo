@@ -1,0 +1,8 @@
+# Volitelná komponenta: Elasticsearch, Kibana (s data view eda-logs-*) a Fluent Bit DaemonSet.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - elasticsearch.yaml
+  - kibana.yaml
+  - fluent-bit.yaml

@@ -24,11 +24,11 @@ class MessagingMetricsTest {
     void should_incrementPerTag_whenRecorded() {
         metrics.produced("a");
         metrics.produced("a");
-        metrics.consumed("a", MessagingMetrics.OUTCOME_PROCESSED);
+        metrics.consumed("a", MessagingMetrics.OUTCOME_STORED);
         metrics.deadLettered("a");
 
         assertThat(registry.get(MessagingMetrics.PRODUCED).tag("topic", "a").counter().count()).isEqualTo(2.0);
-        assertThat(registry.get(MessagingMetrics.CONSUMED).tag("outcome", "processed").counter().count()).isEqualTo(1.0);
+        assertThat(registry.get(MessagingMetrics.CONSUMED).tag("outcome", "stored").counter().count()).isEqualTo(1.0);
         assertThat(registry.get(MessagingMetrics.DEAD_LETTERED).counter().count()).isEqualTo(1.0);
     }
 }

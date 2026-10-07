@@ -3,7 +3,7 @@ package cz.demo.eda.order.domain;
 import cz.demo.eda.order.event.OrderCreated;
 import cz.demo.eda.order.event.PaymentCompleted;
 import cz.demo.eda.order.event.PaymentFailed;
-import cz.demo.eda.order.messaging.OrderEventPublisher;
+import cz.demo.eda.order.outbox.OutboxPublisher;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -16,9 +16,14 @@ import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Optional;
+import java.util.function.UnaryOperator;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class OrderServiceTest {
@@ -26,48 +31,54 @@ class OrderServiceTest {
     private static final Instant NOW = Instant.parse("2026-01-01T12:00:00Z");
 
     @Mock
-    private OrderEventPublisher publisher;
-
     private OrderRepository repository;
+    @Mock
+    private OutboxPublisher outbox;
+
     private OrderService service;
 
     @BeforeEach
     void setUp() {
-        repository = new OrderRepository();
-        service = new OrderService(repository, publisher, Clock.fixed(NOW, ZoneOffset.UTC));
+        service = new OrderService(repository, outbox, Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
     @Test
-    @DisplayName("Založení objednávky ji uloží a publikuje OrderCreated se stejným ID a correlationId")
-    void should_saveAndPublish_whenOrderCreated() {
+    @DisplayName("Založení objednávky ji uloží a zařadí OrderCreated se stejným ID a correlationId do outboxu")
+    void should_saveAndPublishToOutbox_whenOrderCreated() {
+        when(repository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
         var order = service.createOrder("c-1", new BigDecimal("99.90"), "CZK", "corr-1");
 
         var captor = ArgumentCaptor.forClass(OrderCreated.class);
-        verify(publisher).publish(captor.capture());
+        verify(outbox).publish(eq("orders.created"), captor.capture());
         var event = captor.getValue();
-        assertThat(repository.findById(order.id())).contains(order);
+        assertThat(order.status()).isEqualTo(OrderStatus.PENDING_PAYMENT);
+        assertThat(order.createdAt()).isEqualTo(NOW);
         assertThat(event.orderId()).isEqualTo(order.id());
         assertThat(event.correlationId()).isEqualTo("corr-1");
         assertThat(event.amount()).isEqualByComparingTo("99.90");
-        assertThat(order.createdAt()).isEqualTo(NOW);
     }
 
     @Test
     @DisplayName("PaymentCompleted převede objednávku do stavu PAID")
     void should_markPaid_whenPaymentCompleted() {
-        var order = service.createOrder("c-1", BigDecimal.TEN, "CZK", "corr");
+        givenStoredOrder(pending());
 
-        var result = service.applyPaymentResult(PaymentCompleted.of("corr", order.id(), "p-1", BigDecimal.TEN));
+        var result = service.applyPaymentResult(PaymentCompleted.of("corr", "o-1", "p-1", BigDecimal.TEN));
 
-        assertThat(result).get().extracting(Order::status).isEqualTo(OrderStatus.PAID);
+        assertThat(result).get().satisfies(o -> {
+            assertThat(o.status()).isEqualTo(OrderStatus.PAID);
+            assertThat(o.paymentId()).isEqualTo("p-1");
+            assertThat(o.updatedAt()).isEqualTo(NOW);
+        });
     }
 
     @Test
     @DisplayName("PaymentFailed převede objednávku do stavu PAYMENT_FAILED s důvodem")
     void should_markFailed_whenPaymentFailed() {
-        var order = service.createOrder("c-1", BigDecimal.TEN, "CZK", "corr");
+        givenStoredOrder(pending());
 
-        var result = service.applyPaymentResult(PaymentFailed.of("corr", order.id(), "declined"));
+        var result = service.applyPaymentResult(PaymentFailed.of("corr", "o-1", "declined"));
 
         assertThat(result).get().satisfies(o -> {
             assertThat(o.status()).isEqualTo(OrderStatus.PAYMENT_FAILED);
@@ -78,10 +89,9 @@ class OrderServiceTest {
     @Test
     @DisplayName("Finální stav se dalším výsledkem platby nezmění")
     void should_keepFinalState_whenSecondResultArrives() {
-        var order = service.createOrder("c-1", BigDecimal.TEN, "CZK", "corr");
-        service.applyPaymentResult(PaymentCompleted.of("corr", order.id(), "p-1", BigDecimal.TEN));
+        givenStoredOrder(pending().markPaid("p-1", NOW));
 
-        var result = service.applyPaymentResult(PaymentFailed.of("corr", order.id(), "late"));
+        var result = service.applyPaymentResult(PaymentFailed.of("corr", "o-1", "late"));
 
         assertThat(result).get().extracting(Order::status).isEqualTo(OrderStatus.PAID);
     }
@@ -89,12 +99,26 @@ class OrderServiceTest {
     @Test
     @DisplayName("Výsledek platby pro neznámou objednávku vrátí prázdno")
     void should_returnEmpty_whenOrderUnknown() {
+        when(repository.update(eq("unknown"), any())).thenReturn(Optional.empty());
+
         assertThat(service.applyPaymentResult(PaymentFailed.of("corr", "unknown", "x"))).isEmpty();
     }
 
     @Test
     @DisplayName("Hledání podle null ID vrátí prázdno")
     void should_returnEmpty_whenFindByNullId() {
+        when(repository.findById(null)).thenReturn(Optional.empty());
+
         assertThat(service.findById(null)).isEmpty();
+    }
+
+    @SuppressWarnings("unchecked")
+    private void givenStoredOrder(Order stored) {
+        when(repository.update(eq(stored.id()), any())).thenAnswer(inv ->
+                Optional.of(((UnaryOperator<Order>) inv.getArgument(1)).apply(stored)));
+    }
+
+    private static Order pending() {
+        return Order.create("o-1", "c-1", BigDecimal.TEN, "CZK", NOW.minusSeconds(60));
     }
 }

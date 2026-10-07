@@ -1,6 +1,5 @@
 package cz.demo.eda.order.config;
 
-import cz.demo.eda.order.support.ProcessedEventStore;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -14,11 +13,5 @@ public class AppConfig {
     @Bean
     Clock clock() {
         return Clock.systemUTC();
-    }
-
-    /** Paměť zpracovaných eventId pro idempotentní listener. */
-    @Bean
-    ProcessedEventStore processedEventStore() {
-        return new ProcessedEventStore();
     }
 }

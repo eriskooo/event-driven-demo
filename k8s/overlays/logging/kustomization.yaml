@@ -1,0 +1,11 @@
+# Base + Elasticsearch, Kibana a Fluent Bit.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: eda-demo
+
+resources:
+  - ../../base
+
+components:
+  - ../../components/logging

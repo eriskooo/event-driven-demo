@@ -1,13 +1,11 @@
 package cz.demo.eda.payment.messaging;
 
-import cz.demo.eda.payment.support.Topics;
 import cz.demo.eda.payment.event.OrderCreated;
-import cz.demo.eda.payment.event.PaymentCompleted;
-import cz.demo.eda.payment.support.ProcessedEventStore;
-import cz.demo.eda.payment.domain.PaymentProcessingException;
-import cz.demo.eda.payment.domain.PaymentSimulator;
+import cz.demo.eda.payment.inbox.InboxRepository;
 import cz.demo.eda.payment.support.MessagingMetrics;
+import cz.demo.eda.payment.support.Tracing;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -15,87 +13,97 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.kafka.support.Acknowledgment;
+import tools.jackson.databind.json.JsonMapper;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.contains;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class OrderCreatedListenerTest {
 
     @Mock
-    private PaymentSimulator simulator;
-    @Mock
-    private PaymentResultPublisher publisher;
+    private InboxRepository inbox;
     @Mock
     private Acknowledgment ack;
 
     private SimpleMeterRegistry registry;
-    private ProcessedEventStore store;
     private OrderCreatedListener listener;
 
     @BeforeEach
     void setUp() {
         registry = new SimpleMeterRegistry();
-        store = new ProcessedEventStore();
-        listener = new OrderCreatedListener(simulator, publisher, store, new MessagingMetrics(registry));
+        listener = new OrderCreatedListener(inbox, JsonMapper.builder().build(), new MessagingMetrics(registry));
     }
 
     @Test
-    @DisplayName("Zpracuje objednávku, publikuje výsledek a potvrdí offset")
-    void should_publishResultAndAck_whenFirstDelivery() {
+    @DisplayName("Objednávku uloží do inboxu s correlationId z hlavičky a potvrdí offset")
+    void should_storeAndAck_whenFirstDelivery() {
         var event = order();
-        var result = PaymentCompleted.of("c", event.orderId(), "p-1", BigDecimal.TEN);
-        when(simulator.process(event)).thenReturn(result);
+        var record = record(event);
+        record.headers().add(Tracing.CORRELATION_ID_HEADER, "corr-h".getBytes(StandardCharsets.UTF_8));
+        when(inbox.store(any(), anyString(), anyString(), anyString(), any())).thenReturn(true);
 
-        listener.onOrderCreated(event, ack);
+        listener.onOrderCreated(record, ack);
 
-        verify(publisher).publish(result);
+        verify(inbox).store(eq(event.eventId()), eq("orders.created"), eq("o-1"), contains("\"orderId\":\"o-1\""),
+                eq("corr-h"));
         verify(ack).acknowledge();
-        assertThat(store.isProcessed(event.eventId())).isTrue();
-        assertThat(consumed(MessagingMetrics.OUTCOME_PROCESSED)).isEqualTo(1.0);
+        assertThat(consumed(MessagingMetrics.OUTCOME_STORED)).isEqualTo(1.0);
     }
 
     @Test
-    @DisplayName("Duplicitní OrderCreated nepublikuje druhý výsledek, ale offset potvrdí")
-    void should_skipAndAck_whenDuplicate() {
-        var event = order();
-        when(simulator.process(event)).thenReturn(PaymentCompleted.of("c", event.orderId(), "p", BigDecimal.TEN));
+    @DisplayName("Duplicitní OrderCreated jen potvrdí a započítá jako duplicate")
+    void should_ackAndCountDuplicate_whenAlreadyInInbox() {
+        when(inbox.store(any(), anyString(), anyString(), anyString(), any())).thenReturn(false);
 
-        listener.onOrderCreated(event, ack);
-        listener.onOrderCreated(event, ack);
+        listener.onOrderCreated(record(order()), ack);
 
-        verify(simulator, times(1)).process(event);
-        verify(ack, times(2)).acknowledge();
+        verify(ack).acknowledge();
         assertThat(consumed(MessagingMetrics.OUTCOME_DUPLICATE)).isEqualTo(1.0);
     }
 
     @Test
-    @DisplayName("Při technické chybě nepotvrdí offset ani neoznačí událost – rozhodne error handler")
-    void should_propagateAndNotAck_whenProcessingFails() {
+    @DisplayName("Bez hlavičky použije correlationId z těla události")
+    void should_useBodyCorrelationId_whenHeaderMissing() {
         var event = order();
-        when(simulator.process(event)).thenThrow(new PaymentProcessingException("boom"));
+        when(inbox.store(any(), anyString(), anyString(), anyString(), any())).thenReturn(true);
 
-        assertThatThrownBy(() -> listener.onOrderCreated(event, ack)).isInstanceOf(PaymentProcessingException.class);
+        listener.onOrderCreated(record(event), ack);
+
+        verify(inbox).store(eq(event.eventId()), anyString(), anyString(), anyString(), eq("corr-body"));
+    }
+
+    @Test
+    @DisplayName("Při chybě ukládání offset nepotvrdí – rozhodne Kafka error handler")
+    void should_notAck_whenInboxStoreFails() {
+        when(inbox.store(any(), anyString(), anyString(), anyString(), any()))
+                .thenThrow(new IllegalStateException("db down"));
+
+        assertThatIllegalStateException().isThrownBy(() -> listener.onOrderCreated(record(order()), ack));
 
         verify(ack, never()).acknowledge();
-        verifyNoInteractions(publisher);
-        assertThat(store.isProcessed(event.eventId())).isFalse();
     }
 
     private double consumed(String outcome) {
-        var counter = registry.find(MessagingMetrics.CONSUMED)
-                .tags("topic", Topics.ORDERS_CREATED, "outcome", outcome).counter();
+        var counter = registry.find(MessagingMetrics.CONSUMED).tag("outcome", outcome).counter();
         return counter == null ? 0 : counter.count();
     }
 
     private static OrderCreated order() {
-        return OrderCreated.of("c", "o-1", "cust", BigDecimal.TEN, "CZK");
+        return OrderCreated.of("corr-body", "o-1", "cust", BigDecimal.TEN, "CZK");
+    }
+
+    private static ConsumerRecord<String, OrderCreated> record(OrderCreated event) {
+        return new ConsumerRecord<>("orders.created", 0, 0, event.orderId(), event);
     }
 }

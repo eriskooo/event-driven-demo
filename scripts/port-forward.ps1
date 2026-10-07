@@ -1,28 +1,25 @@
-# Zpřístupní UI a order-service na localhostu. Ctrl+C (nebo zavření okna) ukončí všechny port-forwardy.
+# Zpřístupní na localhostu služby, které jsou v namespace eda-demo nasazené. Ctrl+C ukončí vše.
 $ns = 'eda-demo'
 $forwards = @(
-    @('svc/order-service', '8080:8080'),
-    @('svc/payment-service', '8081:8080'),
-    @('svc/grafana', '3000:3000'),
-    @('svc/prometheus', '9090:9090'),
-    @('svc/kibana', '5601:5601'),
-    @('svc/elasticsearch', '9200:9200')
+    @('order-service', '8080:8080', 'http://localhost:8080/orders'),
+    @('payment-service', '8081:8080', 'http://localhost:8081/actuator/health'),
+    @('postgres', '5432:5432', 'jdbc:postgresql://localhost:5432/eda'),
+    @('grafana', '3000:3000', 'http://localhost:3000 (admin/admin)'),
+    @('prometheus', '9090:9090', 'http://localhost:9090'),
+    @('kibana', '5601:5601', "http://localhost:5601 (data view 'EDA logs')"),
+    @('elasticsearch', '9200:9200', 'http://localhost:9200')
 )
 
-$processes = foreach ($f in $forwards) {
-    Start-Process -FilePath kubectl -ArgumentList @('-n', $ns, 'port-forward', $f[0], $f[1]) -NoNewWindow -PassThru `
-        -RedirectStandardOutput ([System.IO.Path]::GetTempFileName())
+$processes = @()
+foreach ($f in $forwards) {
+    # Volitelné komponenty (monitoring, logging) nemusí být nasazené.
+    kubectl -n $ns get "svc/$($f[0])" 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { continue }
+    $processes += Start-Process -FilePath kubectl -ArgumentList @('-n', $ns, 'port-forward', "svc/$($f[0])", $f[1]) `
+        -NoNewWindow -PassThru -RedirectStandardOutput ([System.IO.Path]::GetTempFileName())
+    Write-Host ('{0,-16} {1}' -f $f[0], $f[2])
 }
-
-Write-Host @'
-order-service    http://localhost:8080/orders
-payment-service  http://localhost:8081/actuator/health
-Grafana          http://localhost:3000   (admin / admin)
-Prometheus       http://localhost:9090
-Kibana           http://localhost:5601   (Discover -> data view "EDA logs")
-Elasticsearch    http://localhost:9200
-Press Ctrl+C to stop.
-'@
+Write-Host 'Press Ctrl+C to stop.'
 
 try {
     Wait-Process -Id $processes.Id

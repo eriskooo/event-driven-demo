@@ -1,0 +1,25 @@
+# Základní deploy: Kafka, PostgreSQL a obě služby. Observabilitu přidávají overlaye v ../overlays.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: eda-demo
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: eda-demo
+    includeSelectors: false
+
+resources:
+  - namespace.yaml
+  - kafka/kafka.yaml
+  - postgres/postgres.yaml
+  - order-service/order-service.yaml
+  - payment-service/payment-service.yaml
+
+# Image se buildí lokálně (imagePullPolicy: Never); tag lze přepsat např.
+# `kustomize edit set image order-service=order-service:1.2.3`.
+images:
+  - name: order-service
+    newTag: dev
+  - name: payment-service
+    newTag: dev

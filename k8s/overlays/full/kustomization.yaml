@@ -1,0 +1,12 @@
+# Base + kompletní observabilita (metriky i logy).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: eda-demo
+
+resources:
+  - ../../base
+
+components:
+  - ../../components/monitoring
+  - ../../components/logging

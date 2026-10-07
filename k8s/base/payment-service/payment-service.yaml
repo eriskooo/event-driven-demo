@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-service-config
+  labels:
+    app.kubernetes.io/name: payment-service
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  DB_URL: jdbc:postgresql://postgres:5432/eda
+  DB_USERNAME: payment_service
+  # Heap jen 60 % limitu – zbytek potřebuje metaspace, vlákna a direct buffery Kafka klienta.
+  JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60 -XX:+ExitOnOutOfMemoryError
+  # Pravděpodobnost business zamítnutí platby (0–1).
+  PAYMENT_FAILURE_RATE: "0.2"
+  # Objednávka s touto částkou vždy selže technicky → retry → orders.created.DLT.
+  PAYMENT_POISON_AMOUNT: "666"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  labels:
+    app.kubernetes.io/name: payment-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment-service
+        app.kubernetes.io/part-of: eda-demo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "8080"
+    spec:
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # Čeká na Kafku a DB: KafkaAdmin při startu vytváří topicy a Flyway migruje schéma –
+        # bez nich by pod skončil v CrashLoopBackOff s rostoucí prodlevou restartů.
+        - name: wait-for-dependencies
+          image: busybox:1.37.0
+          command: ["sh", "-c", "until nc -z kafka 9092 && nc -z postgres 5432; do echo waiting for kafka and postgres; sleep 2; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: payment-service
+          image: payment-service:dev
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: payment-service-config
+          env:
+            # Služba vidí jen svůj Secret, ne hesla ostatních.
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: payment-service-db
+                  key: password
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 36
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  labels:
+    app.kubernetes.io/name: payment-service
+spec:
+  selector:
+    app.kubernetes.io/name: payment-service
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

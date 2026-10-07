@@ -1,0 +1,12 @@
+# Volitelná komponenta: Prometheus (scrapuje pody s anotací prometheus.io/scrape) a Grafana s dashboardem.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - prometheus.yaml
+  - grafana/grafana.yaml
+
+configMapGenerator:
+  - name: grafana-dashboards
+    files:
+      - grafana/eda-overview.json

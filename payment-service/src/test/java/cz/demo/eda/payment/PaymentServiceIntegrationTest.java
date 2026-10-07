@@ -1,10 +1,14 @@
 package cz.demo.eda.payment;
 
+import cz.demo.eda.payment.domain.PaymentRepository;
+import cz.demo.eda.payment.domain.PaymentSimulator;
+import cz.demo.eda.payment.domain.PaymentStatus;
+import cz.demo.eda.payment.event.OrderCreated;
+import cz.demo.eda.payment.inbox.InboxRepository;
+import cz.demo.eda.payment.outbox.OutboxPublisher;
+import cz.demo.eda.payment.support.MessagingMetrics;
 import cz.demo.eda.payment.support.Topics;
 import cz.demo.eda.payment.support.Tracing;
-import cz.demo.eda.payment.event.OrderCreated;
-import cz.demo.eda.payment.domain.PaymentSimulator;
-import cz.demo.eda.payment.support.MessagingMetrics;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -15,12 +19,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.context.annotation.Import;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.kafka.KafkaContainer;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -40,40 +41,46 @@ import static org.mockito.Mockito.verify;
 
 @SpringBootTest(properties = {
         "payment.failure-rate=0",
-        "eda.kafka.retry.max-retries=3",
-        "eda.kafka.retry.initial-interval=50ms",
-        "eda.kafka.retry.max-interval=100ms"})
-@Testcontainers
+        "eda.inbox.max-attempts=4",
+        "eda.inbox.initial-backoff=50ms",
+        "eda.inbox.max-backoff=200ms",
+        "eda.inbox.poll-interval-ms=100",
+        "eda.outbox.poll-interval-ms=100"})
+@Import({KafkaTestcontainer.class, PostgresTestcontainer.class})
 class PaymentServiceIntegrationTest {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(30);
 
-    @Container
-    @ServiceConnection
-    static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka:4.3.1");
-
+    @Autowired
+    private KafkaContainer kafka;
     @Autowired
     private KafkaTemplate<Object, Object> kafkaTemplate;
     @Autowired
     private JsonMapper jsonMapper;
     @Autowired
     private MeterRegistry registry;
+    @Autowired
+    private InboxRepository inbox;
+    @Autowired
+    private PaymentRepository payments;
     @MockitoSpyBean
     private PaymentSimulator simulator;
 
     @Test
-    @DisplayName("OrderCreated vede k PaymentCompleted v payments.result se stejným orderId a correlationId")
+    @DisplayName("OrderCreated přes inbox a outbox vede k PaymentCompleted se stejným orderId a correlationId")
     void should_publishPaymentCompleted_whenOrderCreated() throws Exception {
         var order = OrderCreated.of("it-corr-2", "order-ok", "cust", new BigDecimal("15.00"), "CZK");
 
         send(order);
 
-        var result = KafkaTestSupport.awaitRecord(KAFKA.getBootstrapServers(), Topics.PAYMENTS_RESULT,
+        var result = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT,
                 r -> "order-ok".equals(r.key()), TIMEOUT);
         var json = jsonMapper.readTree(result.value());
         assertThat(json.get("type").asString()).isEqualTo("PaymentCompleted");
         assertThat(json.get("correlationId").asString()).isEqualTo("it-corr-2");
         assertThat(KafkaTestSupport.header(result, Tracing.CORRELATION_ID_HEADER)).isEqualTo("it-corr-2");
+        assertThat(payments.findByOrderId("order-ok")).get().extracting(p -> p.status()).isEqualTo(PaymentStatus.COMPLETED);
+        assertThat(inbox.findStatus(order.eventId())).contains("PROCESSED");
     }
 
     @Test
@@ -85,28 +92,30 @@ class PaymentServiceIntegrationTest {
         send(order);
 
         await().atMost(TIMEOUT).until(() -> counter(MessagingMetrics.CONSUMED, "outcome", "duplicate") >= 1);
-        var results = KafkaTestSupport.collectRecords(KAFKA.getBootstrapServers(), Topics.PAYMENTS_RESULT,
+        var results = KafkaTestSupport.collectRecords(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT,
                 r -> "order-dup".equals(r.key()), Duration.ofSeconds(3));
         assertThat(results).hasSize(1);
     }
 
     @Test
-    @DisplayName("Poison objednávka se zkusí 1+3krát, skončí v DLT a její offset se commitne")
-    void should_retryThenDeadLetter_whenAmountIsPoison() throws Exception {
+    @DisplayName("Poison objednávka se v inboxu zkusí 4krát s backoffem, skončí v DLT a offset je hned potvrzený")
+    void should_retryInInboxThenDeadLetter_whenAmountIsPoison() throws Exception {
         var order = OrderCreated.of("it-corr-4", "order-poison", "cust", new BigDecimal("666"), "CZK");
 
         send(order);
 
-        var dead = KafkaTestSupport.awaitRecord(KAFKA.getBootstrapServers(), Topics.dltOf(Topics.ORDERS_CREATED),
+        var dead = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.dltOf(Topics.ORDERS_CREATED),
                 r -> "order-poison".equals(r.key()), TIMEOUT);
         assertThat(jsonMapper.readTree(dead.value()).get("orderId").asString()).isEqualTo("order-poison");
-        assertThat(KafkaTestSupport.header(dead, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN)
-                + KafkaTestSupport.header(dead, KafkaHeaders.DLT_EXCEPTION_FQCN)).contains("PaymentProcessingException");
+        assertThat(KafkaTestSupport.header(dead, OutboxPublisher.DLT_EXCEPTION_FQCN)).endsWith("PaymentProcessingException");
+        assertThat(KafkaTestSupport.header(dead, OutboxPublisher.DLT_ATTEMPTS)).isEqualTo("4");
+        assertThat(KafkaTestSupport.header(dead, Tracing.CORRELATION_ID_HEADER)).isEqualTo("it-corr-4");
         verify(simulator, times(4)).process(argThat(o -> "order-poison".equals(o.orderId())));
-        await().atMost(TIMEOUT).until(() ->
-                counter(MessagingMetrics.DEAD_LETTERED, "topic", Topics.dltOf(Topics.ORDERS_CREATED)) == 1.0);
+        assertThat(inbox.findStatus(order.eventId())).contains("FAILED");
+        assertThat(payments.findByOrderId("order-poison")).isEmpty();
+        assertThat(counter(MessagingMetrics.DEAD_LETTERED, "topic", Topics.dltOf(Topics.ORDERS_CREATED))).isEqualTo(1.0);
         await().atMost(TIMEOUT).untilAsserted(() -> assertThat(consumerLag("payment-service")).isZero());
-        assertThat(KafkaTestSupport.collectRecords(KAFKA.getBootstrapServers(), Topics.PAYMENTS_RESULT,
+        assertThat(KafkaTestSupport.collectRecords(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT,
                 r -> "order-poison".equals(r.key()), Duration.ofSeconds(2))).isEmpty();
     }
 
@@ -123,7 +132,7 @@ class PaymentServiceIntegrationTest {
 
     /** Součet rozdílů mezi koncem partitions a commitnutým offsetem consumer group. */
     private long consumerLag(String groupId) throws Exception {
-        try (var admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers()))) {
+        try (var admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers()))) {
             var committed = admin.listConsumerGroupOffsets(groupId).partitionsToOffsetAndMetadata().get();
             var partitions = admin.describeTopics(List.of(Topics.ORDERS_CREATED)).allTopicNames().get()
                     .get(Topics.ORDERS_CREATED).partitions().stream()
