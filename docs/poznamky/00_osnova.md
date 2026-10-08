@@ -16,7 +16,7 @@ Nie je to kurz Kafky ani Camundy od nuly. Berieme z nich len to, čo demo reáln
   - [`order-service/`](../../order-service) – REST API objednávok, inbox, outbox
   - [`payment-service/`](../../payment-service) – simulácia platby, inbox, outbox, DLT listener
   - [`order-process/`](../../order-process) – orchestrátor: BPMN proces v Camunde, Kafka listenery, job workery
-- Celkový prehľad, verzie a konfigurácia sú v [`README.md`](../../README.md) (po česky). Poznámky ho vysvetľujú krok po kroku.
+- Stručný prehľad, architektúra a verzie sú v [`README.md`](../../README.md) (po česky). Všetky detaily (konfigurácia, scenáre, overenie) sú v týchto kapitolách.
 
 ### Štruktúra každej kapitoly (01–11)
 

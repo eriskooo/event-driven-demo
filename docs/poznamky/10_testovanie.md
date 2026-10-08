@@ -132,6 +132,27 @@ order-service ~40 s, payment-service ~49 s (pri písaní spustené cez Git Bash)
 
 Všetko naraz cez agregátor (README): `mvn verify` v koreni. Toto som pri písaní nespúšťal – spúšťal som tri projekty zvlášť.
 
+### 4. Čo bolo overené pri vývoji
+
+História overenia prenesená z README (autor repa, nie pri písaní poznámok).
+
+**Orchestrácia cez Camundu (2026-10-08):** e2e test [`OrderProcessIntegrationTest`](../../order-process/src/test/java/cz/demo/eda/process/OrderProcessIntegrationTest.java) beží proti skutočnej Kafke a Zeebe (Camunda Process Test). Nasadenie na Kubernetes (docker-desktop): teardown + build-images + deploy prebehli, 6/6 podov Ready; 10 objednávok → 9× `PAID`, 1× `PAYMENT_FAILED` (miera zamietnutia 0.2); suma 666 → `PENDING_PAYMENT`, inštancia `ACTIVE` na `payment_result` a payment-service zalogoval záznam z `payments.commands.DLT`; v logoch len dva očakávané `ERROR` riadky (poison); Camunda search API ukázalo 10× `COMPLETED` + 1× `ACTIVE`; špička pamäte Camundy ~550 MB z limitu 1536Mi; Prometheus endpoint na porte 9600 odpovedá.
+
+**Choreografická verzia pred prechodom na Camundu (2026-10-07)** – tok `orders.created` → payment-service → `payments.result` → order-service:
+
+| Overené | Ako |
+|---|---|
+| Unit, repository a integračné testy | `mvn clean install` – 187 testov (order 94, payment 93), 0 zlyhaní; repository testy `@DataJpaTest` proti PostgreSQL; Testcontainers `postgres:18.6-alpine` + `apache/kafka:4.3.1` |
+| Deploy profilu `base` | Kubernetes v Docker Desktope (v1.32): Kafka, PostgreSQL, obe služby Ready za ~30 s, 0 reštartov |
+| E2E tok | 9 objednávok: 7× `PAID`, 1× `PAYMENT_FAILED` (simulované zamietnutie), poison 666 zostala `PENDING_PAYMENT` |
+| Inbox/outbox v DB | všetky outbox riadky publikované; inboxy `PROCESSED`; poison správa `FAILED` po 4 pokusoch s chybou v `last_error`, jej DLT správa odoslaná |
+| Izolácia schém | `order_service` na `payments.payments` → `permission denied for schema payments` |
+| Flyway migrácia nad existujúcou DB | V2 (indexy pre úklid) sa aplikovala pri redeployi |
+| Úklid | po zostarnutí 4+4 riadkov o 8 dní a crone každú minútu zmazané presne 4 inbox + 4 outbox v každej službe, čerstvé riadky zostali (overené na JDBC verzii; JPA verzia pokrytá testami) |
+| JPA verzia v clustri | Hibernate validácia schémy proti DB z Flyway prešla; 9 objednávok: 6× `PAID`, 2× `PAYMENT_FAILED`, poison `FAILED` po 4 pokusoch → DLT, žiadna platba po rollbacku, outbox prázdny |
+
+Profily `monitoring`, `logging` a `full` sú po reštrukturalizácii overené len renderom (`kubectl kustomize`); v predchádzajúcej verzii projektu (bez DB) bol plný stack nasadený a overený E2E. Neoverené: beh na **minikube**.
+
 ---
 
 ## Kód z repa

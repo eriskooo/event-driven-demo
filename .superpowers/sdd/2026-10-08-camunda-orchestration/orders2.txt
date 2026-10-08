@@ -1,6 +1,0 @@
-order 750f6791-be96-4888-8bd4-00efcd3c3f71  amount 291.92  correlationId demo-1791440262-1781-1
-order e18be0cf-4f77-4549-84ad-7fe341044e26  amount 480.44  correlationId demo-1791440263-0120-2
-order 66a9279e-a8c0-4464-a4dd-b54a4b8b3459  amount 76.50  correlationId demo-1791440263-7890-3
-order 1c85f903-a98e-4379-874e-fc8240e90510  amount 465.34  correlationId demo-1791440263-0cba-4
-order 71616fc8-881b-4a5a-ab54-4a6b9c355b59  amount 92.72  correlationId demo-1791440263-4919-5
-Check status: curl http://localhost:8080/orders/<id>

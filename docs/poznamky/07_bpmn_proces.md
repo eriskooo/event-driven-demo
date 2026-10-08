@@ -188,7 +188,7 @@ Stiahni Camunda Desktop Modeler (camunda.com → Download → Modeler), otvor v 
 
 **Neoverené:** Modeler na stroji, kde sa poznámky písali, nainštalovaný nie je. Diagram v README (mermaid) je prepis tohto súboru.
 
-Ako dostať zmenu do bežiaceho stacku (README, „Modelování“): uložiť BPMN → `.\scripts\build-images.ps1` → reštart `order-process` (napr. `kubectl -n eda-demo rollout restart deploy/order-process`). Pri štarte sa nasadí nová verzia procesu. Bežiace inštancie zostanú na **svojej** (starej) verzii, nové pobežia na novej. Toto som pri písaní nespúšťal (zmena kódu a nasadenie sú mimo rozsahu overovania).
+Ako dostať zmenu do bežiaceho stacku: `order-process` nasadzuje BPMN pri štarte sám (`@Deployment`), takže stačí uložiť BPMN → `.\scripts\build-images.ps1` → reštart `order-process` (napr. `kubectl -n eda-demo rollout restart deploy/order-process`). Pri štarte sa nasadí nová verzia procesu. Bežiace inštancie zostanú na **svojej** (starej) verzii, nové pobežia na novej. Toto som pri písaní nespúšťal (zmena kódu a nasadenie sú mimo rozsahu overovania).
 
 ---
 
@@ -220,7 +220,7 @@ V choreografii (`ba78d05`) bol „proces“ len v hlavách vývojárov:
 | `payment_completed_gateway` | `switch` v `OrderService.transition` |
 | `confirm_order` / `cancel_order` | `order.markPaid` / `order.markPaymentFailed` priamo v order-service |
 
-Keby si chcel pridať napr. „ak platba nepríde do 10 minút, zruš objednávku“, v choreografii by si potreboval vlastnú tabuľku s termínmi a plánovač. V BPMN je to jeden **timer** – buď ako boundary event na receive tasku, ktorým nahradíš `payment_result`, alebo vetva event-based gateway ([kapitola 12](12_cvicenia.md), cvičenie 1).
+Keby si chcel pridať napr. „ak platba nepríde do 10 minút, zruš objednávku“, v choreografii by si potreboval vlastnú tabuľku s termínmi a plánovač. V BPMN je to jeden **timer** – buď ako boundary event na receive tasku, ktorým nahradíš `payment_result`, alebo vetva event-based gateway ([kapitola 12](12_cvicenia.md), cvičenie 9).
 
 ---
 

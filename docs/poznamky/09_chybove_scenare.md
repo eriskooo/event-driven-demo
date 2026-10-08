@@ -14,14 +14,19 @@
 ### 1. Kde všade sa dá „spadnúť“
 
 ```mermaid
-flowchart LR
+flowchart TB
     OS[order-service] -->|outbox| T1[(orders.created)]
-    T1 -->|"① Zeebe dole → Kafka retry → orders.created.DLT"| OP[order-process]
-    OP -->|"② Kafka dole → job retries → incident"| T2[(payments.commands)]
+    T1 --> L1["order-process<br/>listener"]
+    L1 -->|"publishMessage<br/>① Zeebe dole → Kafka retry → orders.created.DLT"| Z["Zeebe<br/>riadi tok"]
+    W["order-process<br/>worker"] -->|"activateJobs (pull) / completeJob"| Z
+    W -->|"② Kafka dole → job retries → incident v Zeebe"| T2[(payments.commands)]
     T2 -->|"③ technická chyba → inbox retry → payments.commands.DLT"| PS[payment-service]
     PS --> T3[(payments.result)]
-    T3 -->|"④ výsledok skôr ako proces čaká → TTL"| OP
+    T3 --> L2["order-process<br/>listener"]
+    L2 -->|"publishMessage<br/>④ výsledok skôr ako proces čaká → Zeebe ho drží (TTL)"| Z
 ```
+
+Stav toku (kde stojí token, koľko retries jobu zostáva, podržané správy) je vždy v Zeebe; `order-process` len prenáša správy a joby medzi Kafkou a Zeebe.
 
 | # | Scenár | Mechanizmus | Kde to vidíš | Overené naživo? |
 |---|---|---|---|---|
@@ -39,7 +44,7 @@ flowchart LR
 - **Business** (`PaymentFailed`, 20 %) nie je chyba – proces ide vetvou `Cancel order` a objednávka skončí `PAYMENT_FAILED`.
 - **Technická** (poison 666) je chyba – inbox ju skúša 4× a potom ju odloží do DLT. Výsledok platby **nikdy nevznikne**, takže proces sa o ničom nedozvie a čaká.
 
-Proces **nemá timeout**. To je zámer dema: ukazuje, prečo by sa hodil timeout – timer na receive tasku alebo event-based gateway ([kapitola 12](12_cvicenia.md), cvičenie 1).
+Proces **nemá timeout**. To je zámer dema: ukazuje, prečo by sa hodil timeout – timer na receive tasku alebo event-based gateway ([kapitola 12](12_cvicenia.md), cvičenie 9). Timer boundary event sa nedá pripnúť priamo na intermediate catch event `payment_result`, len na aktivitu.
 
 ### 3. Incident
 
@@ -251,7 +256,7 @@ PENDING_PAYMENT
 
 - `publishMessage` zlyhá (`UNAVAILABLE: io exception`, `Connection refused: camunda/…:26500`).
 - `DefaultErrorHandler`: 1 + 3 pokusy (0,5 s → 1 s → 2 s), spolu ~3,5 s, potom DLT. Po každom neúspechu „Seeking to offset 5“ – Spring Kafka sa vráti na tú istú správu.
-- Objednávka zostane `PENDING_PAYMENT` **bez inštancie procesu**. Toto README uvádza ako známe správanie.
+- Objednávka zostane `PENDING_PAYMENT` **bez inštancie procesu**. Je to známe správanie dema: `orders.created.DLT` nikto nečíta, objednávku treba ručne poslať znova (redrive, krok 6).
 
 V DLT je pôvodná správa + hlavičky Spring Kafka s dôvodom (stack trace skrátený):
 
@@ -382,6 +387,14 @@ Aby bol redrive idempotentný: ak by Zeebe správu už mal, odmietne ju a druhá
 
 1. Pošli `.\scripts\send-orders.ps1 -Count 1 -Amount 666` a v Operate (alebo `process-instances/search` s `state` = `ACTIVE`) nájdi novú inštanciu. Potom ju zachráň podľa kroku 2. **Očakávanie:** `PAYMENT_FAILED` s tvojím `reason` a inštancia `COMPLETED` cez `cancel_order`.
 2. Zopakuj krok 4 (`order-process` na 0), ale pošli 3 objednávky. **Očakávanie:** lag na `orders.created` spolu 3, po obnovení všetky tri dobehnú. **Nezabudni obnoviť repliku na 1 a overiť Ready.**
+3. **Business zlyhanie bez DLT** – nastav 100 % zamietnutí a pošli objednávky:
+
+   ```powershell
+   kubectl -n eda-demo set env deploy/payment-service PAYMENT_FAILURE_RATE=1.0
+   .\scripts\send-orders.ps1 -Count 5
+   ```
+
+   **Očakávanie:** všetkých 5 skončí `PAYMENT_FAILED` cez vetvu `Cancel order`, nič v DLT. Obnova: `kubectl -n eda-demo set env deploy/payment-service PAYMENT_FAILURE_RATE-` (odstráni prepísanie, platí opäť 0.2 z ConfigMapy). Pri písaní poznámok nespúšťané (scenár pochádza z pôvodného README).
 
 ---
 

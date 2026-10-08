@@ -64,7 +64,7 @@ Ako si worker joby berie? Dve možnosti:
 | **Long polling** (`ActivateJobs`) | worker sa pýta „máš job typu X?“; gateway drží požiadavku otvorenú, kým job nepríde alebo nevyprší timeout | **áno** |
 | **Job streaming** (push) | worker otvorí dlhodobý stream a broker mu joby posiela hneď | nie je zapnutý |
 
-Overené metrikou brokera: `zeebe_broker_jobs_pushed_count_total` je `0`, kým exportér hlási stovky `JOB_BATCH` záznamov (dávky aktivácie jobov). V praxi je to teda long polling (README to tak aj uvádza). Pre demo to nevadí: long polling vráti job prakticky hneď (v logoch ~17 ms od vzniku inštancie po odoslanie `ProcessPayment`).
+Overené metrikou brokera: `zeebe_broker_jobs_pushed_count_total` je `0`, kým exportér hlási stovky `JOB_BATCH` záznamov (dávky aktivácie jobov). V praxi je to teda long polling. Pre demo to nevadí: long polling vráti job prakticky hneď (v logoch ~17 ms od vzniku inštancie po odoslanie `ProcessPayment`).
 
 ### 4. Primárne vs. sekundárne úložisko
 
@@ -319,7 +319,7 @@ S Camundou je odpoveď jeden pohľad do Operate (alebo `element-instances/search
 | `variables/search` s `value":"abc"` nič nenájde | Hodnota je JSON – reťazec musí byť v úvodzovkách | `"value":"\"abc\""` |
 | `order-process` loguje `Failed to activate jobs … UNAVAILABLE: io exception` | Zeebe gateway (gRPC 26500) nie je dostupná | `kubectl get pod camunda-0`; po reštarte trvá chvíľu, kým gRPC začne odpovedať (kapitola 09) |
 | Po teardowne zmizli všetky inštancie | PVC sa zmazalo | Očakávané; reštart podu ich nezmaže |
-| Nová verzia BPMN sa nenasadila | Image `order-process` nebol prebuildnutý / reštartovaný | `build-images.ps1` + reštart deploymentu (README: Modelování) |
+| Nová verzia BPMN sa nenasadila | Image `order-process` nebol prebuildnutý / reštartovaný | `build-images.ps1` + reštart deploymentu ([kapitola 07](07_bpmn_proces.md), krok 5) |
 
 ---
 

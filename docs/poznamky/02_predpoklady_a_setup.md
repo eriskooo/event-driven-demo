@@ -22,7 +22,7 @@ Analógia: `docker compose` je skúška v obývačke, Kubernetes je skúška na 
 | Nástroj | Na čo | Povinné? |
 |---|---|---|
 | Docker Desktop | build image (`docker build`), beh kontajnerov | áno |
-| Kubernetes v Docker Desktope | beh celého stacku | áno (alebo minikube, README) |
+| Kubernetes v Docker Desktope | beh celého stacku | áno (alebo minikube, krok 2) |
 | `kubectl` | deploy, logy, exec do podov | áno (prichádza s Docker Desktopom) |
 | JDK 21 + Maven 3.9+ | `mvn test` / `mvn verify` mimo Dockera | len na testy |
 | Camunda Desktop Modeler | otvoriť a upravovať BPMN | voliteľné |
@@ -32,7 +32,7 @@ Image sa buildia **v Dockeri** (multi-stage Dockerfile s Maven image), takže na
 
 ### 3. Pamäť
 
-README uvádza pre profil `base` ~2,5 GB. Reálne namerané (`docker stats`, 2026-10-08, po ~25 min behu a ~25 objednávkach):
+Odhad pre profil `base` je ~2,5 GB: Kafka ~0,4 GB, PostgreSQL ~50 MB, Camunda ~1–1,5 GB, každá z troch služieb ~0,25 GB. Profil `full` pridá ~2 GB (Elasticsearch ~1 GB, Kibana ~0,8 GB, Grafana ~0,4 GB). Reálne namerané (`docker stats`, 2026-10-08, po ~25 min behu a ~25 objednávkach):
 
 | Kontajner | Použitá RAM / limit |
 |---|---|
@@ -45,7 +45,11 @@ README uvádza pre profil `base` ~2,5 GB. Reálne namerané (`docker stats`, 202
 
 Spolu ~2 GiB. Camunda je najväčšia položka (Zeebe + Operate + Tasklist v jednom JVM).
 
-> **Windows/WSL2 pasca:** proces `vmmemWSL` v správcovi úloh môže ukazovať aj 12+ GB, hoci kontajnery berú ~2 GB. Je to page cache Linux VM (buildy, sťahovanie image), ktorú Windows nedostane späť sám. README popisuje jednorazové uvoľnenie aj trvalé nastavenie v `.wslconfig`. **Nepoužívaj** `autoMemoryReclaim=gradual` – Kubernetes v Docker Desktope potom nenaštartuje.
+> **Windows/WSL2 pasca:** proces `vmmemWSL` v správcovi úloh môže ukazovať aj 12+ GB, hoci kontajnery berú ~2 GB. Je to page cache Linux VM (buildy, sťahovanie image), ktorú Windows nedostane späť sám.
+>
+> - Jednorazové uvoľnenie: `wsl -d docker-desktop sh -c "echo 3 > /proc/sys/vm/drop_caches"`
+> - Trvalo: v `%UserProfile%\.wslconfig` nastav `memory=10GB` a v sekcii `[experimental]` `autoMemoryReclaim=dropcache`, potom `wsl --shutdown` a reštart Docker Desktopu.
+> - **Nepoužívaj** `autoMemoryReclaim=gradual` – prepne cgroup v2 bez delegovaného controllera `cpuset` a kubelet Kubernetes v Docker Desktope potom nenaštartuje (`cgroup ["kubepods"] has some missing controllers: cpuset`).
 
 ---
 
@@ -100,6 +104,15 @@ Docker Desktop | 16 CPU | 10431574016
 - Kontext musí byť `docker-desktop`. Ak nie je: `kubectl config use-context docker-desktop`.
 - `MemTotal` je RAM pridelená Docker VM v bajtoch (tu ~9,7 GiB). Pre `base` stačia ~3 GiB voľné, pre profil `full` (s Elasticsearch, Kibanou a Grafanou) počítaj s ďalšími ~2 GB.
 - Skripty podľa kontextu poznajú, či majú image nahrať do minikube. Pri `docker-desktop` to netreba – Kubernetes v Docker Desktope vidí lokálne image priamo.
+
+**Alternatíva: minikube** (odporúčané 4 CPU / 10 GB). Na stroji, kde sa poznámky písali, minikube nie je, takže toto je **neoverené** (bash príkazy z pôvodného README, v PowerShelli rovnaké):
+
+```bash
+minikube start --driver=docker --cpus=4 --memory=10240
+kubectl config use-context minikube
+```
+
+Pri kontexte `minikube` skript `build-images` nahrá image cez `minikube image load` (žiadna registry). Celý cluster zmaže `minikube delete`.
 
 ### 3. JDK a Maven (len na testy)
 
@@ -178,7 +191,7 @@ Prečo multi-stage Dockerfile? Build (Maven + JDK) je veľký, runtime (len JRE 
 Setup by bol ľahší: v `ba78d05` stack tvorili len Kafka, PostgreSQL a **dve** služby. Camunda pridala:
 
 - jeden StatefulSet s PVC (~0,5–1,5 GB RAM),
-- databázu `camunda` v PostgreSQL (vytvára ju init skript, ktorý beží **len nad prázdnym PVC** – preto README pri upgrade starého prostredia vyžaduje teardown),
+- databázu `camunda` v PostgreSQL (vytvára ju init skript, ktorý beží **len nad prázdnym PVC** – preto upgrade staršieho prostredia vyžaduje teardown, [kapitola 03](03_spustenie_stacku.md)),
 - tretiu službu `order-process`.
 
 To je cena orchestrácie: ďalšia infraštruktúra, ktorú treba prevádzkovať.
@@ -193,7 +206,7 @@ To je cena orchestrácie: ďalšia infraštruktúra, ktorú treba prevádzkovať
 | Image sa nahrávajú do minikube, hoci ho nemáš | Kontext nie je `docker-desktop` | `kubectl config use-context docker-desktop` |
 | `.\scripts\deploy.ps1 cannot be loaded because running scripts is disabled` | Execution policy `Restricted` | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | Kubernetes po zmene `.wslconfig` nenaštartuje (`cgroup ["kubepods"] has some missing controllers: cpuset`) | `autoMemoryReclaim=gradual` | Použi `dropcache`, `wsl --shutdown`, reštart Docker Desktopu |
-| `vmmemWSL` berie 12 GB | Page cache Linux VM | `wsl -d docker-desktop sh -c "echo 3 > /proc/sys/vm/drop_caches"` (z README) |
+| `vmmemWSL` berie 12 GB | Page cache Linux VM | `wsl -d docker-desktop sh -c "echo 3 > /proc/sys/vm/drop_caches"`, trvalo `.wslconfig` (vyššie) |
 | `mvn test` padá na Testcontainers | Nebeží Docker | Spusti Docker Desktop; testy potrebujú Docker aj mimo Kubernetes |
 
 ---
@@ -207,7 +220,7 @@ Nie. Image sa buildia v Dockeri (Maven beží v build stage Dockerfile). JDK 21 
 Aby služby nič nezdieľali (ani parent POM, ani kód). Koreňový `pom.xml` je len agregátor pre pohodlné `mvn verify`.
 
 **Koľko RAM berie stack `base`?**
-Namerané ~2 GiB, README počíta s ~2,5 GB. Najviac Camunda (~0,5 GB, limit 1,5 GiB) a Kafka (~0,5 GB).
+Namerané ~2 GiB, odhad je ~2,5 GB. Najviac Camunda (~0,5 GB, limit 1,5 GiB) a Kafka (~0,5 GB).
 
 **Prečo sa skript pýta na kubectl kontext?**
 Pri `docker-desktop` vidí Kubernetes lokálne image priamo, pri minikube ich treba nahrať cez `minikube image load`.

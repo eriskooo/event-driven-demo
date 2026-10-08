@@ -57,11 +57,13 @@ payment-service „vedel“, že na `OrderCreated` má reagovať platbou, a orde
 
 ```mermaid
 flowchart LR
-    OS[order-service] -- "OrderCreated (event)" --> OP[order-process<br/>+ Camunda]
+    OS[order-service] -- "OrderCreated (event)" --> OP["orchestrátor:<br/>Zeebe riadi tok (BPMN)<br/>order-process = most ku Kafke"]
     OP -- "ProcessPayment (príkaz)" --> PS[payment-service]
     PS -- "PaymentCompleted / PaymentFailed (event)" --> OP
     OP -- "ConfirmOrder / CancelOrder (príkaz)" --> OS
 ```
+
+Orchestrátor tu tvoria dve časti: **Zeebe** (engine Camundy) drží stav každej objednávky a rozhoduje, čo nasleduje; **`order-process`** je len most – správy z Kafky odovzdá Zeebe a príkazy, ktoré Zeebe zadá ako joby, pošle do Kafky. Všetky šípky idú cez Kafku; Zeebe samotný Kafku nepozná ([kapitola 06](06_camunda_a_zeebe.md), [kapitola 08](08_most_zeebe_kafka.md)).
 
 | | Choreografia | Orchestrácia |
 |---|---|---|
@@ -96,8 +98,8 @@ Proces v Camunde je **stavový automat celého toku**, nielen objednávky: „č
 ```mermaid
 flowchart LR
     client([curl / send-orders]) --> OS[order-service<br/>REST · inbox · outbox]
-    OS -- orders.created --> OP[order-process<br/>listenery · workery]
-    OP <-- gRPC --> Z[Camunda 8.10<br/>Zeebe + Operate]
+    OS -- orders.created --> OP[order-process<br/>most: listenery · workery]
+    OP -- "gRPC (klient): publishMessage,<br/>activateJobs / completeJob" --> Z[Camunda 8.10<br/>Zeebe riadi tok + Operate]
     OP -- payments.commands --> PS[payment-service<br/>inbox · outbox]
     PS -- payments.result --> OP
     OP -- orders.commands --> OS

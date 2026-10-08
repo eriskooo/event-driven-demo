@@ -269,7 +269,7 @@ public boolean store(InboxEntry entry) {
 }
 ```
 
-Najprv `existsById`, potom `save`. Ak by dve vlákna uložili to isté `eventId` naraz, druhé narazí na **porušenie primárneho kľúča**, výnimka vráti správu Kafke a pri ďalšom doručení už `existsById` vráti `true`. (README spomína `INSERT … ON CONFLICT DO NOTHING`, kód to robí cez `existsById` + PK – výsledok je rovnaký.)
+Najprv `existsById`, potom `save`. Ak by dve vlákna uložili to isté `eventId` naraz, druhé narazí na **porušenie primárneho kľúča**, výnimka vráti správu Kafke a pri ďalšom doručení už `existsById` vráti `true`. Žiadne `INSERT … ON CONFLICT DO NOTHING` – deduplikáciu robí `existsById` + primárny kľúč.
 
 ### Prečo processor nemá `@Transactional`
 
@@ -297,6 +297,38 @@ Medzi transakciou 1 a 2 nie je riadok zamknutý. Iná replika si ho v tej chvíl
 | 2 | 1000 ms |
 | 3 | 2000 ms |
 | 4 | – (`maxAttempts = 4`) → `FAILED` + DLT |
+
+### JPA a deklaratívne transakcie
+
+- **JPA** (Spring Data JPA, Hibernate 7) – entity `Order`, `Payment`, `InboxEntry`, `OutboxEntry`. Stav sa mení len cez metódy entít (`markPaid`, `markPublished`…), uloženie zariadi dirty checking pri commite. Schému spravuje Flyway, Hibernate ju len validuje (`ddl-auto: validate`). JSONB stĺpce (`payload`, `headers`) cez `@JdbcTypeCode(SqlTypes.JSON)`.
+- **Transakcie len deklaratívne:** servisy (`@Service`) majú `@Transactional` nad triedou (čítacie metódy `readOnly`), repozitáre `@Transactional(readOnly = true)` nad rozhraním. Žiadne programové transakcie.
+- Plánovače a listenery transakcie neriadia – volajú transakčné servisy:
+
+| Netransakčný spúšťač | Transakčná servisa | Čo urobí jedna transakcia |
+|---|---|---|
+| `InboxProcessor` (`@Scheduled`) | `InboxService` | `process(id)`: handler + `PROCESSED`; `recordFailure(id)`: retry alebo `FAILED` + DLT |
+| `OutboxRelay` (`@Scheduled`) | `OutboxService` | `publishBatch()`: zamknúť dávku, odoslať, označiť `published_at` |
+| `RetentionCleanup` (`@Scheduled`) | `CleanupService` | zmazať jednu dávku starých riadkov |
+| `*Listener` (`@KafkaListener`) | `InboxService.store` | uložiť správu do inboxu (duplicita → `false`) |
+| `OrderController` | `OrderService` | uložiť objednávku + `OrderCreated` do outboxu |
+
+### Úklid starých správ
+
+`cleanup/RetentionCleanup` (v každej službe nad jej schémou) raz denne (`EDA_CLEANUP_CRON`, predvolene 03:00) zmaže dokončené správy z inboxu (`PROCESSED`, `FAILED`) a publikované správy z outboxu staršie ako `EDA_CLEANUP_RETENTION_DAYS` (predvolene 7 dní). Čakajúce a nepublikované správy nemaže nikdy. Maže po dávkach (`eda.cleanup.batch-size`, 1000), metrika `eda_cleanup_deleted_total{table}`.
+
+Pozor: po zmazaní už inbox nespozná duplicitu takto starej správy – retencia musí byť dlhšia ako najdlhšie možné opakované doručenie. Konfigurácia: [kapitola 03](03_spustenie_stacku.md#konfigurácia-služieb).
+
+### Databáza: schémy a používatelia
+
+Jedna inštancia PostgreSQL (`StatefulSet`, PVC 1 Gi). Doménové služby zdieľajú databázu `eda`, ale každá má **vlastnú schému a vlastného DB používateľa** bez prístupu k cudzej schéme – zdieľa sa len server. Camunda má vlastnú databázu `camunda`, `order-process` DB nepoužíva.
+
+| Schéma | Používateľ | Tabuľky | Migrácie |
+|---|---|---|---|
+| `orders` | `order_service` | `orders`, `inbox`, `outbox` | `order-service/src/main/resources/db/migration` (Flyway) |
+| `payments` | `payment_service` | `payments`, `inbox`, `outbox` | `payment-service/src/main/resources/db/migration` (Flyway) |
+| databáza `camunda` | `camunda` | tabuľky spravuje Camunda (sekundárne úložisko, plní ho exportér) | Camunda sama pri štarte |
+
+Používateľov a schémy zakladá init skript v [`k8s/base/postgres/postgres.yaml`](../../k8s/base/postgres/postgres.yaml). Heslá sú v troch oddelených Secretoch (admin, order-service, payment-service) plus Secret `camunda-db` pre Camundu – každý vidí len svoje. Init skript beží len nad prázdnym PVC, preto v skôr nasadenom clustri databáza `camunda` nevznikne a treba teardown ([kapitola 03](03_spustenie_stacku.md), Časté chyby).
 
 ---
 

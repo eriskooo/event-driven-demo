@@ -6,75 +6,60 @@ a události v JSON). Každá doménová služba má vlastní schéma v PostgreSQ
 vzory **transactional outbox** a **transactional inbox**. Základní deploy obsahuje služby, Camundu,
 Kafku a DB; observabilita (Prometheus/Grafana, Elasticsearch/Kibana/Fluent Bit) se přidává volitelně.
 
-## Poznámky na samoštúdium
-
-Tutoriál „Event-driven a Camunda po lopate“ (slovensky, kapitoly 00–13 s ověřenými příkazy pro PowerShell):
-[`docs/poznamky/00_osnova.md`](docs/poznamky/00_osnova.md).
+> **Podrobný návod krok po kroku:** [`docs/poznamky/00_osnova.md`](docs/poznamky/00_osnova.md) –
+> tutoriál „Event-driven a Camunda po lopate“ (slovensky, kapitoly 00–13, ověřené příkazy pro PowerShell).
+> README je jen stručný přehled; detaily, vysvětlení a konfigurace jsou v kapitolách, na které odkazuje.
 
 ## Architektura
 
 ```mermaid
-flowchart LR
-    client([curl / send-orders]) -- "POST /orders<br/>GET /orders/{id}" --> OS
+sequenceDiagram
+    autonumber
+    actor C as Klient
+    participant OS as order-service
+    participant K as Kafka
+    participant OP as order-process<br/>(most)
+    participant Z as Zeebe<br/>(stavový automat)
+    participant PS as payment-service
 
-    subgraph eda-demo namespace
-        OS[order-service<br/>REST · inbox · outbox]
-        PS[payment-service<br/>inbox · outbox]
-
-        subgraph OP [order-process – bez DB]
-            OL[OrderCreatedListener<br/>PaymentResultListener] --> GW[ProcessGateway<br/>publishMessage]
-            W[JobWorkery<br/>request-payment · confirm-order · cancel-order] --> CP[CommandPublisher]
-        end
-
-        subgraph CAM [Camunda 8.10 – Orchestration Cluster]
-            Z[Zeebe<br/>log + RocksDB na PVC]
-            OPR[Operate / Tasklist]
-        end
-
-        subgraph Kafka [Kafka 4.3 – KRaft]
-            T1[(orders.created)]
-            T2[(payments.commands)]
-            T3[(payments.result)]
-            T4[(orders.commands)]
-        end
-
-        PG[(PostgreSQL 18<br/>eda: orders · payments<br/>camunda: vedlejší úložiště)]
-
-        OS -- OrderCreated --> T1 --> OL
-        GW -- "gRPC" --> Z
-        W -- "activate / complete job" --> Z
-        CP -- ProcessPayment --> T2 --> PS
-        PS -- "PaymentCompleted / PaymentFailed" --> T3 --> OL
-        CP -- "ConfirmOrder / CancelOrder" --> T4 --> OS
-        Z -- exportér --> PG
-        OPR --> PG
-        OS --> PG
-        PS --> PG
+    C->>OS: POST /orders
+    OS->>OS: uloží objednávku PENDING_PAYMENT + outbox (1 transakce)
+    OS->>K: OrderCreated → orders.created
+    K->>OP: OrderCreated → OrderCreatedListener
+    OP->>Z: publishMessage OrderCreated (messageId = eventId)
+    Note over Z: start instance order-fulfillment<br/>token → Request payment → vznikne job
+    OP->>Z: worker: activateJobs (pull)
+    Z-->>OP: job request-payment
+    OP->>K: ProcessPayment → payments.commands
+    OP->>Z: completeJob
+    Note over Z: token čeká na zprávu Payment result
+    K->>PS: příkaz → inbox
+    PS->>PS: simulace platby, payments + outbox (1 transakce)
+    PS->>K: PaymentCompleted / PaymentFailed → payments.result
+    K->>OP: výsledek → PaymentResultListener
+    OP->>Z: publishMessage PaymentResult (correlationKey = orderId)
+    Note over Z: gateway podle paymentStatus ROZHODNE větev
+    alt paymentStatus = COMPLETED
+        Z-->>OP: job confirm-order (worker si ho vyzvedne)
+        OP->>K: ConfirmOrder → orders.commands
+    else jinak
+        Z-->>OP: job cancel-order (worker si ho vyzvedne)
+        OP->>K: CancelOrder → orders.commands
     end
+    OP->>Z: completeJob → instance dokončena
+    K->>OS: příkaz → inbox
+    OS->>OS: PAID / PAYMENT_FAILED
 ```
 
-### Tok objednávky
+**Tok řídí Zeebe:** podle BPMN modelu drží stav každé objednávky, rozhoduje o dalším kroku (vytvoří
+job, vybere větev gateway) a čeká na zprávy. `order-process` je jen most – listenery předávají události
+z Kafky do Zeebe jako zprávy a workery provádějí joby, které jim Zeebe přidělí. Spojení k Zeebe otevírá
+vždy `order-process` (worker si job vyzvedne – pull); Zeebe sám nikoho nevolá a Kafku nezná.
 
-1. `POST /orders` v **jedné DB transakci** uloží objednávku (`PENDING_PAYMENT`) a řádek do
-   `orders.outbox`. `OutboxRelay` ho do 0.5 s pošle jako `OrderCreated` do `orders.created`.
-2. **order-process** (`OrderCreatedListener`) zprávu přečte a publikuje ji do Camundy jako zprávu
-   `OrderCreated` (message start event, `messageId = eventId`) – tím vznikne instance procesu
-   `order-fulfillment`. Service task `Request payment` vytvoří job a worker pošle příkaz
-   `ProcessPayment` do `payments.commands`.
-3. payment-service příkaz **jen uloží do `payments.inbox`** a potvrdí offset. `InboxProcessor` ho
-   v transakci zpracuje – simulace platby, zápis do `payments.payments` a výsledku do `payments.outbox`:
-   - s pravděpodobností `PAYMENT_FAILURE_RATE` (výchozí 0.2) platbu **zamítne** → `PaymentFailed`
-     (business výsledek, žádný retry),
-   - jinak → `PaymentCompleted`,
-   - částka `PAYMENT_POISON_AMOUNT` (výchozí **666**) vyvolá **technickou chybu** → inbox retry
-     s backoffem 0.5 s → 1 s → 2 s, po 4. pokusu stav `FAILED` a zpráva do `payments.commands.DLT`.
-4. Výsledek jde přes `payments.result` do order-process: `PaymentResultListener` ho zkoreluje
-   do čekající instance jako zprávu `PaymentResult` (`correlationKey = orderId`). Gateway podle
-   `paymentStatus` zvolí service task `Confirm order` nebo `Cancel order`; worker pošle příkaz
-   `ConfirmOrder` / `CancelOrder` do `orders.commands`.
-5. order-service příkaz uloží do `orders.inbox`, `InboxProcessor` nastaví `PAID` / `PAYMENT_FAILED`.
+Úložiště: order-service a payment-service mají vlastní schéma v PostgreSQL (`eda`); Zeebe drží stav
+procesů ve svém logu (RocksDB na PVC) a exportér ho kopíruje do databáze `camunda`, odkud čte Operate.
 
-### Proces v Camundě
+## Proces v Camundě
 
 ```mermaid
 flowchart LR
@@ -86,207 +71,110 @@ flowchart LR
     confirm --> ok((("Order<br/>confirmed")))
     cancel --> ko((("Order<br/>cancelled")))
 
-    %% Kafka topicy – tečkovaně, aby bylo vidět, kudy proces komunikuje se službami
-    t1[("orders.created")] -. "OrderCreated<br/>(start instance)" .-> start
-    pay -. "ProcessPayment" .-> t2[("payments.commands")]
-    t3[("payments.result")] -. "PaymentCompleted / PaymentFailed<br/>(korelace přes orderId)" .-> wait
-    confirm -. "ConfirmOrder" .-> t4[("orders.commands")]
-    cancel -. "CancelOrder" .-> t4
-
     classDef event fill:#fff8e1,stroke:#f57f17,stroke-width:2px
     classDef endEvent fill:#ffebee,stroke:#c62828,stroke-width:3px
     classDef task fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     classDef gateway fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
-    classDef topic fill:#eceff1,stroke:#607d8b,stroke-dasharray:4 3
     class start,wait event
     class ok,ko endEvent
     class pay,confirm,cancel task
     class gw gateway
-    class t1,t2,t3,t4 topic
 ```
 
 Kroužky jsou události (✉ = zpráva), zaoblené obdélníky service tasky (pod názvem job type), kosočtverec
-exclusive gateway, dvojitý kroužek konec. Tečkované šipky ukazují Kafka topicy, přes které proces mluví
-se službami – v samotném BPMN nejsou, most dělá `order-process`. Originál pro Camunda Modeler je
+exclusive gateway, dvojitý kroužek konec. Je to stavový automat, který vykonává Zeebe – kde právě
+stojí token, je stav objednávky. Jak se proces napojuje na Kafku, ukazuje sekvenční diagram v
+[Architektuře](#architektura). Originál pro Camunda Modeler je
 [`order-fulfillment.bpmn`](order-process/src/main/resources/bpmn/order-fulfillment.bpmn).
 
-Token putuje procesem `order-fulfillment` (soubor `order-process/src/main/resources/bpmn/order-fulfillment.bpmn`):
+Elementy procesu, correlation key a gateway s default flow popisuje
+[kapitola 07](docs/poznamky/07_bpmn_proces.md); jak `order-process` překládá zprávy a joby
+(`messageId = eventId`, `eventId` příkazu z `jobKey`, TTL zpráv 1 h) [kapitola 08](docs/poznamky/08_most_zeebe_kafka.md).
 
-| ID elementu | Typ | Co dělá |
-|---|---|---|
-| `order_created` | message start event | zpráva `OrderCreated`; spustí instanci a naplní proměnné `orderId`, `amount`, `currency`, `correlationId` |
-| `request_payment` | service task | job type `request-payment` (retries 3) → worker pošle `ProcessPayment` do `payments.commands` |
-| `payment_result` | intermediate message catch event | zpráva `PaymentResult`, correlation key `=orderId`; čeká na výsledek platby, nastaví `paymentStatus` + `paymentId` / `failureReason` |
-| `payment_completed_gateway` | exclusive gateway | `=paymentStatus = "COMPLETED"` → `Confirm order`, jinak výchozí tok → `Cancel order` |
-| `confirm_order` | service task | job type `confirm-order` (retries 3) → `ConfirmOrder` do `orders.commands` |
-| `cancel_order` | service task | job type `cancel-order` (retries 3) → `CancelOrder` do `orders.commands` |
-| `order_confirmed` / `order_cancelled` | end event | konec větve |
+## Rychlý start
 
-**Zeebe nikoho nevolá.** Všechna spojení otevírá `order-process` jako klient: joby si workery
-vyzvedávají (pull – long polling `activateJobs`; job streaming je ve výchozí konfiguraci klienta vypnutý),
-Kafka listenery zprávy do Zeebe publikují.
+Předpoklady: Docker Desktop se zapnutým Kubernetes (nebo minikube), `kubectl`; pro testy mimo Docker
+JDK 21 a Maven 3.9+. Profil `base` potřebuje ~2,5 GB RAM. Podrobně (minikube, paměť, WSL2):
+[kapitola 02](docs/poznamky/02_predpoklady_a_setup.md).
 
-#### Idempotence a spolehlivost
-
-| Situace | Chování |
-|---|---|
-| Worker odešle příkaz, ale spadne před `completeJob` | Zeebe po timeoutu jobu rozdá job znovu; příkaz odejde se **stejným** `eventId` (z `jobKey`) a inbox cílové služby duplicitu zahodí |
-| Odeslání do Kafky selže | worker job nedokončí a vyhodí výjimku; Zeebe sníží `retries`, při 0 vznikne v Operate **incident** |
-| Duplicitní `OrderCreated` / `PaymentResult` z Kafky | `messageId = eventId` způsobí, že Zeebe zprávu se stejným ID v době její TTL odmítne (`ALREADY_EXISTS`); listener to bere jako úspěch |
-| Zeebe nedostupné při korelaci | listener vyhodí výjimku; `DefaultErrorHandler` zkouší s backoffem, pak pošle zprávu do DLT; offset se potvrdí až po úspěchu |
-| `PaymentResult` dorazí dřív, než proces čeká na catch eventu | zpráva má TTL (výchozí 1 h – musí přesáhnout timeout jobu 5 min + čas na řešení incidentu, jinak by výsledek vypršel a instance čekala donekonečna) a Zeebe ji zkoreluje, jakmile instance dojde na catch event |
-
-#### Úložiště stavu
-
-- **Primární** (zdroj pravdy): log událostí Zeebe a nad ním RocksDB, na PVC. Drží běžící instance,
-  tokeny, proměnné, čekající zprávy a joby.
-- **Vedlejší**: databáze `camunda` v PostgreSQL. Plní ji exportér asynchronně a čte ji Operate,
-  Tasklist a vyhledávací REST API – je proto *eventually consistent* (čerstvá instance se v Operate
-  může objevit se zpožděním).
-
-`order-process` sám žádnou DB nemá – stav drží Zeebe.
-
-#### Operate
-
-`./scripts/port-forward.sh` (nebo `.ps1`) zpřístupní Operate na http://localhost:8088/operate,
-přihlášení `demo` / `demo`. Uvidíš tam:
-
-- **Processes → order-fulfillment** – diagram s počty tokenů na jednotlivých elementech,
-- detail instance – pozici tokenu, proměnné (`orderId`, `amount`, `paymentStatus`, …) a historii kroků,
-- **incidenty** – např. job, kterému došly `retries`, včetně chybové zprávy.
-
-#### Modelování
-
-BPMN je v `order-process/src/main/resources/bpmn/order-fulfillment.bpmn`, otevři ho v Camunda
-Desktop Modeleru. Služba ho při startu nasazuje sama (`@Deployment`), takže po úpravě stačí
-přebuildovat a nasadit image `order-process`.
-
-#### Známé chování dema
-
-Poison částka **666** skončí v `payments.commands.DLT` a výsledek platby nikdy nevznikne – instance
-zůstane čekat na `Payment result`. Proces nemá timeout; v Operate je to vidět jako „zaseknutá“
-objednávka a je to ukázka, proč by se hodil timeout. Timer boundary event jde připojit jen k aktivitě
-(ne k intermediate catch eventu), takže by se `Payment result` musel nahradit receive taskem
-s boundary timerem, nebo event-based gatewayí (zpráva vs. timer).
-
-Pokud je Zeebe nedostupné déle než Kafka retry (~3,5 s), `OrderCreated` skončí v `orders.created.DLT`
-(nikdo ji nečte) a objednávka zůstane `PENDING_PAYMENT` bez instance procesu – je nutné ji
-ručně znovu odeslat (restart/redrive).
-
-### Proč inbox + outbox
-
-| Problém | Řešení |
-|---|---|
-| Uložení do DB a odeslání do Kafky nejde udělat atomicky („dual write“) | **Outbox**: zpráva se zapíše do tabulky ve stejné transakci jako doménová změna; `OutboxRelay` ji odešle a označí `published_at`. Při pádu se pošle znovu (at-least-once). |
-| Kafka doručuje „at least once“ – stejná zpráva může přijít vícekrát | **Inbox**: PK `event_id` – `InboxService.store` nejdřív ověří `existsById`, duplicitu přeskočí; souběžný zápis stejného `eventId` skončí porušením PK a Kafka zprávu doručí znovu (pak už ji `existsById` pozná). |
-| Dlouhé/opakované zpracování blokuje partition a hrozí rebalance | Listener jen uloží zprávu do inboxu a hned potvrdí offset; zpracování s retry běží mimo poll loop. |
-| Retry s backoffem musí přežít restart podu | Stav retry (`attempts`, `next_attempt_at`, `last_error`) je v DB. |
-| Při chybě se nesmí zapsat „půlka“ změn | Zpracování zprávy (doménová změna + outbox + stav inboxu) je jedna transakce `InboxService.process` – chyba ji celou vrátí. Plánovač pak v nové transakci `InboxService.recordFailure` zapíše retry nebo `FAILED` + DLT. |
-
-Relay i processor zamykají řádky přes `SELECT … FOR UPDATE SKIP LOCKED` (JPA `@Lock(PESSIMISTIC_WRITE)`
-+ hint `jakarta.persistence.lock.timeout = -2`), takže služby lze škálovat na víc replik bez dvojího
-zpracování. Mezi neúspěšnou transakcí zpracování a zápisem retry není zpráva zamčená – jiná replika si
-ji v tu chvíli může vzít; nejhorší důsledek je pokus navíc, který pokryje idempotence.
-
-### Perzistence a transakce
-
-- **JPA** (Spring Data JPA, Hibernate 7) – entity `Order`, `Payment`, `InboxEntry`, `OutboxEntry`;
-  přechody stavů jen přes metody entit, ukládání dirty checkingem. Schéma spravuje Flyway,
-  Hibernate ho jen validuje (`ddl-auto=validate`). JSONB sloupce přes `@JdbcTypeCode(SqlTypes.JSON)`.
-- **Transakce jen deklarativně:** servisy (`@Service`) mají `@Transactional` nad třídou (čtecí metody
-  `readOnly`), repozitáře `@Transactional(readOnly = true)` nad rozhraním. Žádné programové transakce.
-- Plánovače a listenery transakce neřídí – volají transakční servisy:
-
-| Netransakční (spouštěč) | Transakční servisa | Co dělá jedna transakce |
-|---|---|---|
-| `InboxProcessor` (`@Scheduled`) | `InboxService` | `process(id)`: handler + `PROCESSED`; `recordFailure(id)`: retry / `FAILED` + DLT |
-| `OutboxRelay` (`@Scheduled`) | `OutboxService` | `publishBatch()`: zamknout dávku, odeslat, označit `published_at` |
-| `RetentionCleanup` (`@Scheduled`) | `CleanupService` | smazat jednu dávku starých řádků |
-| `*Listener` (`@KafkaListener`) | `InboxService.store` | uložit zprávu do inboxu (duplicita → `false`) |
-| `OrderController` | `OrderService` | uložit objednávku + `OrderCreated` do outboxu |
-
-**Úklid:** `cleanup/RetentionCleanup` (v každé službě nad jejím schématem) jednou denně smaže
-dokončené zprávy z inboxu (`PROCESSED`, `FAILED`) a publikované zprávy z outboxu starší než
-`EDA_CLEANUP_RETENTION_DAYS` (výchozí 7). Čekající a nepublikované zprávy nemaže nikdy. Maže po
-dávkách, metrika `eda_cleanup_deleted_total{table}`. Po smazání už inbox nerozpozná duplicitu takto
-staré zprávy – retence musí být delší než nejdelší možné opakované doručení.
-
-### Databáze
-
-Jedna instance PostgreSQL (`StatefulSet`, PVC 1 Gi). Doménové služby sdílejí databázi `eda`, každá má
-**vlastní schéma a vlastního DB uživatele** bez přístupu k cizímu schématu – nic se nesdílí kromě serveru.
-Camunda má vlastní databázi `camunda`. `order-process` DB nepoužívá:
-
-| Schéma | Uživatel | Tabulky | Migrace |
-|---|---|---|---|
-| `orders` | `order_service` | `orders`, `inbox`, `outbox` | `order-service/src/main/resources/db/migration` (Flyway) |
-| `payments` | `payment_service` | `payments`, `inbox`, `outbox` | `payment-service/src/main/resources/db/migration` (Flyway) |
-| databáze `camunda` | `camunda` | tabulky spravuje Camunda (vedlejší úložiště, plní exportér) | Camunda sama při startu |
-
-Uživatele a schémata zakládá init skript v `k8s/base/postgres/postgres.yaml`; hesla jsou ve třech
-oddělených Secretech (admin, order-service, payment-service) plus Secret `camunda-db` pro Camundu –
-každý vidí jen svoje.
-
-> **Upgrade existujícího prostředí:** init skript PostgreSQL běží jen nad prázdným PVC. Databáze `camunda`
-> a její uživatel se proto v dřív nasazeném clusteru nevytvoří – je nutný `./scripts/teardown.sh`
-> (smaže namespace včetně dat DB) a nový deploy.
-
-### Kontrakt zpráv
-
-Služby záměrně **nesdílí žádný kód** (žádný `common` modul) – každá má vlastní kopii tříd událostí
-(a doménové služby i infrastruktury inbox/outbox). Kontraktem je pouze JSON formát zpráv:
-
-| Topic | Partitions | Producent → konzument | Group |
-|---|---|---|---|
-| `orders.created` | 3 | order-service → order-process | `order-process` |
-| `payments.commands` | 3 | order-process → payment-service | `payment-service` |
-| `payments.result` | 3 | payment-service → order-process | `order-process` |
-| `orders.commands` | 3 | order-process → order-service | `order-service` |
-| `*.DLT` | 3 (stejně jako zdrojový topic) | error handler konzumenta | `payment-service-dlt` čte `payments.commands.DLT` |
-
-Klíč zprávy je vždy `orderId`. Každá služba zakládá topicy, které produkuje nebo konzumuje, a DLT svých konzumentů
-(`KafkaConfig#edaTopics`): `payments.commands.DLT` (payment-service), `orders.commands.DLT` (order-service),
-`orders.created.DLT` a `payments.result.DLT` (order-process).
-
-```json
-// orders.created  (key = orderId)
-{"eventId":"5b7c…","timestamp":"2026-10-07T08:31:31.70Z","correlationId":"demo-1","orderId":"9543…",
- "customerId":"c1","amount":10.5,"currency":"CZK"}
-
-// payments.commands (key = orderId)
-{"eventId":"…","timestamp":"…","correlationId":"demo-1","orderId":"9543…","amount":10.5,"currency":"CZK"}
-
-// payments.result (key = orderId) – podtyp určuje pole "type"
-{"type":"PaymentCompleted","eventId":"…","timestamp":"…","correlationId":"demo-1","orderId":"9543…",
- "paymentId":"…","amount":10.5}
-{"type":"PaymentFailed","eventId":"…","timestamp":"…","correlationId":"demo-1","orderId":"9543…",
- "reason":"Payment declined by simulated gateway"}
-
-// orders.commands (key = orderId) – podtyp určuje pole "type"
-{"type":"ConfirmOrder","eventId":"…","timestamp":"…","correlationId":"demo-1","orderId":"9543…","paymentId":"…"}
-{"type":"CancelOrder","eventId":"…","timestamp":"…","correlationId":"demo-1","orderId":"9543…","reason":"…"}
+```bash
+./scripts/build-images.sh          # image :dev pro order-service, payment-service, order-process
+./scripts/deploy.sh                # profil base: Kafka, PostgreSQL, Camunda a tři služby
+./scripts/port-forward.sh          # v samostatném terminálu, Ctrl+C ukončí
+./scripts/send-orders.sh 20        # 20 objednávek s náhodnou částkou
+curl -s localhost:8080/orders/<id> # PENDING_PAYMENT → PAID / PAYMENT_FAILED
+./scripts/teardown.sh              # smaže namespace eda-demo vč. dat DB a Camundy
 ```
 
-Spring type hlavičky (`__TypeId__`) jsou vypnuté, takže konzument nezávisí na Java třídách producenta.
-CorrelationId se přenáší v těle i v Kafka hlavičce `X-Correlation-Id`.
+```powershell
+.\scripts\build-images.ps1
+.\scripts\deploy.ps1
+.\scripts\port-forward.ps1
+.\scripts\send-orders.ps1 -Count 20
+Invoke-RestMethod http://localhost:8080/orders/<id>
+.\scripts\teardown.ps1
+```
 
-### Co projekt demonstruje (a kde to najít)
-
-| Téma | Kde |
+| Co | Kde |
 |---|---|
-| Explicitní topicy s partitions | `config/KafkaConfig#edaTopics` (`KafkaAdmin.NewTopics`), na brokeru `auto.create.topics.enable=false` |
-| Klíč = orderId (pořadí v rámci objednávky) | `OutboxPublisher` (klíč) → `OutboxRelay` |
-| Consumer groups | `order-service`, `payment-service`, `payment-service-dlt`, `order-process` |
-| Potvrzování | order-service a order-process `AckMode.RECORD`, payment-service `MANUAL_IMMEDIATE` (`Acknowledgment`) |
-| Transactional outbox | `outbox/OutboxPublisher`, `outbox/OutboxRelay`, tabulka `outbox` |
-| Transactional inbox + idempotence | `inbox/InboxRepository`, `inbox/InboxProcessor`, tabulka `inbox` |
-| Retry s exponenciálním backoffem + DLT | `InboxProcessor` (`eda.inbox.*`); pro nečitelné zprávy a výpadek DB `KafkaConfig#kafkaErrorHandler` (`DefaultErrorHandler` + `DeadLetterPublishingRecoverer`, `eda.kafka.retry.*`) |
-| CorrelationId v MDC | `CorrelationIdFilter` (HTTP), `CorrelationIdRecordInterceptor` (Kafka), inbox/outbox ho ukládají |
-| Orchestrace BPMN procesem | `order-process/src/main/resources/bpmn/order-fulfillment.bpmn` |
-| Most Zeebe ↔ Kafka | `ProcessGateway`, `messaging/*Listener`, `worker/*`, `CommandPublisher` |
-| Idempotentní příkazy z jobů | `CommandPublisher.commandId` (`eventId` odvozený z `jobKey`) |
-| Deduplikace zpráv v Zeebe | `ProcessGateway` (`messageId = eventId`, `ALREADY_EXISTS` = úspěch) |
-| Strukturované JSON logy | `logging.structured.format.console=ecs` (vestavěné ve Spring Boot) |
+| order-service API | http://localhost:8080/orders |
+| Camunda Operate | http://localhost:8088/operate – `demo` / `demo` |
+| health payment-service / order-process | http://localhost:8081/actuator/health, http://localhost:8082/actuator/health |
+| PostgreSQL | `jdbc:postgresql://localhost:5432/eda`; je-li port 5432 obsazený: `kubectl -n eda-demo port-forward svc/postgres 15432:5432` a `localhost:15432` |
+
+Celý cyklus s očekávanými výstupy: [kapitola 03](docs/poznamky/03_spustenie_stacku.md). Poison částka
+666 (`send-orders.sh 1 666`, `-Count 1 -Amount 666`) ukáže retry → DLT a čekající instanci:
+[kapitola 09](docs/poznamky/09_chybove_scenare.md). Observabilitu přidá `deploy.sh monitoring|logging|full`
+(`deploy.ps1 -Stack …`): [kapitola 11](docs/poznamky/11_observabilita.md).
+
+## Topicy a kontrakt
+
+Služby záměrně **nesdílí žádný kód** – kontraktem je JSON zpráv. Klíč zprávy je vždy `orderId`.
+
+| Topic | Producent → konzument |
+|---|---|
+| `orders.created` | order-service → order-process |
+| `payments.commands` | order-process → payment-service |
+| `payments.result` | payment-service → order-process |
+| `orders.commands` | order-process → order-service |
+| `*.DLT` | konzument po vyčerpání retry → čte jen `payments.commands.DLT` (group `payment-service-dlt`) |
+
+Všechny topicy včetně DLT mají 3 partitions. Ukázky zpráv, consumer groups a ack módy:
+[kapitola 04](docs/poznamky/04_kafka_v_praxi.md); překlad zpráv na Zeebe a zpět:
+[kapitola 08](docs/poznamky/08_most_zeebe_kafka.md).
+
+## Co projekt demonstruje
+
+| Téma | Kde v kódu | Kapitola |
+|---|---|---|
+| Event vs. příkaz, orchestrace místo choreografie | `order-process`, `order-fulfillment.bpmn` | [01](docs/poznamky/01_co_je_event_driven.md) |
+| Topicy, klíč `orderId`, consumer groups, ack módy, DLT | `config/KafkaConfig` (`edaTopics`, `kafkaErrorHandler`) | [04](docs/poznamky/04_kafka_v_praxi.md) |
+| Transactional outbox a inbox, idempotence, retry s backoffem | `outbox/*`, `inbox/*` (dedup `existsById` + PK `event_id`) | [05](docs/poznamky/05_outbox_a_inbox.md) |
+| `SKIP LOCKED`, JPA, deklarativní transakce, úklid | `*Repository` (`@Lock`), `@Transactional` servisy, `cleanup/*` | [05](docs/poznamky/05_outbox_a_inbox.md) |
+| Zeebe: stav toku, pull model, primární vs. sekundární úložiště | `k8s/base/camunda/camunda.yaml`, `camunda.client` v `application.yml` | [06](docs/poznamky/06_camunda_a_zeebe.md) |
+| BPMN: message start, catch event, gateway | `order-fulfillment.bpmn`, `ProcessMessages` | [07](docs/poznamky/07_bpmn_proces.md) |
+| Most Zeebe ↔ Kafka, `messageId = eventId`, `commandId` z `jobKey` | `ProcessGateway`, `messaging/*Listener`, `worker/*`, `CommandPublisher` | [08](docs/poznamky/08_most_zeebe_kafka.md) |
+| Poison zpráva, incident, výpadek Zeebe, redrive z DLT | `PaymentSimulator`, `DeadLetterListener`, `KafkaConfig` | [09](docs/poznamky/09_chybove_scenare.md) |
+| Testcontainers, Camunda Process Test | `*IntegrationTest`, `*RepositoryTest` | [10](docs/poznamky/10_testovanie.md) |
+| CorrelationId v MDC, ECS JSON logy, metriky | `CorrelationIdFilter`, `CorrelationIdRecordInterceptor`, `CorrelationScope` | [11](docs/poznamky/11_observabilita.md) |
+
+Konfigurace (míra zamítnutí plateb, poison částka, retry, TTL zpráv, úklid…) je v ConfigMapách
+`order-service-config`, `payment-service-config` a `order-process-config`; přehled proměnných:
+[kapitola 03, Konfigurácia služieb](docs/poznamky/03_spustenie_stacku.md#konfigurácia-služieb).
+
+## Struktura repozitáře
+
+```
+order-service/            samostatný Maven projekt + Dockerfile (domain, api, inbox, outbox, messaging)
+payment-service/          samostatný Maven projekt + Dockerfile (domain, inbox, outbox, messaging)
+order-process/            orchestrátor: Maven projekt + Dockerfile (BPMN, listenery, workery, CommandPublisher), bez DB
+pom.xml                   jen agregátor (mvn verify nad všemi službami), služby od něj nic nedědí
+k8s/base/                 namespace, Kafka, PostgreSQL, Camunda, order-service, payment-service, order-process
+k8s/components/           volitelné: monitoring (Prometheus, Grafana), logging (ES, Kibana, Fluent Bit)
+k8s/overlays/             profily monitoring, logging, full
+scripts/                  build-images, deploy, teardown, port-forward, send-orders (.sh + .ps1)
+docs/poznamky/            tutoriál, kapitoly 00–13
+```
 
 ## Verze
 
@@ -305,217 +193,14 @@ Ověřené jako aktuální stabilní k 2026-10-07:
 | Grafana | 13.2.3 (volitelné) |
 | Fluent Bit | 5.1.3 (volitelné) |
 
-## Předpoklady
-
-- Docker Desktop (Windows/macOS) – počítej s RAM navíc ~1,5 GiB pro Camundu (viz Paměť)
-- `kubectl`
-- minikube s driverem docker – **nebo** Kubernetes zapnutý v Docker Desktopu (viz níže)
-- Pro build a testy mimo Docker: JDK 21 a Maven 3.9+ (testy potřebují běžící Docker – Testcontainers)
-
-## Spuštění krok za krokem
-
-### 1. Cluster
-
-**minikube** (doporučeno 4 CPU / 10 GB):
+## Testy
 
 ```bash
-minikube start --driver=docker --cpus=4 --memory=10240
-kubectl config use-context minikube
+mvn verify          # unit, repository testy proti PostgreSQL a integrační testy s Kafkou a Camundou (Testcontainers, potřebuje Docker)
 ```
 
-**Alternativa – Docker Desktop Kubernetes:** Settings → Kubernetes → Enable, pak
-`kubectl config use-context docker-desktop`. Skripty to poznají a image do minikube nenahrávají
-(Docker Desktop vidí lokální image přímo).
-
-### 2. Build a testy (volitelné, image se buildí i bez toho)
-
-```bash
-mvn verify          # unit testy, repository testy proti PostgreSQL a integrační testy s Kafkou (Testcontainers)
-```
-
-### 3. Image
-
-```bash
-./scripts/build-images.sh          # bash / macOS / Git Bash
-.\scripts\build-images.ps1         # PowerShell
-```
-
-Buildí se `order-service`, `payment-service` i `order-process`. Multi-stage Dockerfile (Maven build → `jarmode=tools extract --layers` → JRE runtime, non-root).
-Image jsou otagované `:dev` a nahrané přes `minikube image load` (žádná registry).
-
-### 4. Deploy
-
-| Profil | Obsah | Příkaz |
-|---|---|---|
-| `base` (výchozí) | Kafka, PostgreSQL, Camunda, order-service, payment-service, order-process | `./scripts/deploy.sh` · `.\scripts\deploy.ps1` |
-| `monitoring` | base + Prometheus, Grafana | `./scripts/deploy.sh monitoring` · `.\scripts\deploy.ps1 -Stack monitoring` |
-| `logging` | base + Elasticsearch, Kibana, Fluent Bit | `./scripts/deploy.sh logging` · `.\scripts\deploy.ps1 -Stack logging` |
-| `full` | vše | `./scripts/deploy.sh full` · `.\scripts\deploy.ps1 -Stack full` |
-
-Profily jsou Kustomize overlaye (`k8s/overlays/*`) skládající `k8s/base` a komponenty
-`k8s/components/{monitoring,logging}` – observabilitu lze kdykoli přidat dalším `deploy` s jiným
-profilem. Skript čeká na rollout všech workloadů.
-
-Paměť: base potřebuje ~2,5 GB (Kafka ~0.4 GB, PostgreSQL ~50 MB, Camunda ~1–1,5 GB, každá ze tří služeb ~0.25 GB);
-`full` navíc ~2 GB (ES ~1 GB, Kibana ~0.8 GB, Grafana ~0.4 GB).
-
-> **Windows/WSL2:** Docker Desktop VM (`vmmemWSL`) si drží page cache z buildů a stahování image
-> a paměť Windows nevrací – proces může ukazovat i 12+ GB, i když kontejnery berou ~3 GB.
-> Jednorázové uvolnění: `wsl -d docker-desktop sh -c "echo 3 > /proc/sys/vm/drop_caches"`;
-> trvale `memory=10GB` a `[experimental] autoMemoryReclaim=dropcache` v `%UserProfile%\.wslconfig`
-> (pak `wsl --shutdown` a restart Docker Desktopu).
-> **Nepoužívej `autoMemoryReclaim=gradual`** – přepne cgroup v2 bez delegovaného controlleru `cpuset`
-> a kubelet Docker Desktop Kubernetes pak nenastartuje (`cgroup ["kubepods"] has some missing controllers: cpuset`).
-
-### 5. Port-forwardy
-
-```bash
-./scripts/port-forward.sh          # nebo .\scripts\port-forward.ps1, Ctrl+C ukončí
-```
-
-Skript přesměruje jen služby, které jsou nasazené:
-
-| Služba | URL | Profil |
-|---|---|---|
-| order-service | http://localhost:8080/orders | base |
-| payment-service | http://localhost:8081/actuator/health | base |
-| order-process | http://localhost:8082/actuator/health | base |
-| Camunda Operate | http://localhost:8088/operate – `demo` / `demo` | base |
-| PostgreSQL | `jdbc:postgresql://localhost:5432/eda` (např. `order_service` / `order-service-demo`); pokud je port 5432 obsazený hostitelským PostgreSQL: `kubectl -n eda-demo port-forward svc/postgres 15432:5432` a `jdbc:postgresql://localhost:15432/eda` | base |
-| Grafana | http://localhost:3000 – `admin` / `admin`, dashboard **EDA demo – overview** | monitoring |
-| Prometheus | http://localhost:9090 | monitoring |
-| Kibana | http://localhost:5601 – Discover → data view **EDA logs** | logging |
-| Elasticsearch | http://localhost:9200 | logging |
-
-### 6. Posílání objednávek
-
-```bash
-./scripts/send-orders.sh 20              # 20 objednávek s náhodnou částkou
-.\scripts\send-orders.ps1 -Count 20
-
-curl -s localhost:8080/orders/<id>       # stav: PENDING_PAYMENT → PAID / PAYMENT_FAILED
-                                         # průchod procesem: Operate http://localhost:8088/operate
-```
-
-Ručně:
-
-```bash
-curl -i -X POST localhost:8080/orders -H 'Content-Type: application/json' \
-  -H 'X-Correlation-Id: my-test-1' -d '{"customerId":"c1","amount":99.90,"currency":"CZK"}'
-```
-
-## Demo: selhání → retry → DLT
-
-1. **Vyvolej technickou chybu** – pošli objednávku s poison částkou:
-   ```bash
-   ./scripts/send-orders.sh 1 666             # nebo .\scripts\send-orders.ps1 -Count 1 -Amount 666
-   ```
-   Objednávka zůstane `PENDING_PAYMENT` (výsledek platby nikdy nevznikne) a instance procesu v Operate
-   čeká na `Payment result`.
-2. **Retry a DLT v logu payment-service:**
-   ```bash
-   kubectl -n eda-demo logs deploy/payment-service | grep -E 'Delivery attempt|Dead letter'
-   ```
-   Uvidíš 3× `retry in 500/1000/2000 ms`, pak `giving up and moving it to payments.commands.DLT`
-   a `Dead letter received` z DLT listeneru (důvod chyby v hlavičkách `eda-dlt-*`).
-3. **Stav v DB** (inbox si pamatuje pokusy i chybu):
-   ```bash
-   kubectl -n eda-demo exec statefulset/postgres -- psql -U postgres -d eda -c \
-     "SELECT event_id, status, attempts, left(last_error, 60) FROM payments.inbox WHERE status <> 'PROCESSED';"
-   ```
-4. **Obsah DLT přímo v Kafce** (v Git Bash na Windows předřaď `MSYS_NO_PATHCONV=1`, jinak se
-   `/opt/...` přepíše na Windows cestu):
-   ```bash
-   kubectl -n eda-demo exec deploy/kafka -- /opt/kafka/bin/kafka-console-consumer.sh \
-     --bootstrap-server localhost:9092 --topic payments.commands.DLT --from-beginning \
-     --formatter-property print.key=true --formatter-property print.headers=true --timeout-ms 5000
-   ```
-   Consumer lag všech skupin je 0 – offset se potvrdí hned po uložení do inboxu:
-   ```bash
-   kubectl -n eda-demo exec deploy/kafka -- /opt/kafka/bin/kafka-consumer-groups.sh \
-     --bootstrap-server localhost:9092 --describe --all-groups
-   ```
-5. **S profilem logging** – Kibana (Discover, data view *EDA logs*), dotazy KQL:
-   `correlationId : "demo-…"` (cesta objednávky přes order-service a payment-service – Fluent Bit sbírá
-   jen tyto dvě služby, logy order-process ukáže `kubectl -n eda-demo logs deploy/order-process`), `log.level : "ERROR"`.
-6. **S profilem monitoring** – Grafana: panel **Dead-lettered messages**, produced/consumed msg/s,
-   consumer lag, HTTP rate/latence, JVM paměť.
-7. **Business selhání** (bez DLT) – nastav 100% zamítání a pošli objednávky:
-   ```bash
-   kubectl -n eda-demo set env deploy/payment-service PAYMENT_FAILURE_RATE=1.0
-   ./scripts/send-orders.sh 5      # všechny skončí PAYMENT_FAILED
-   ```
-
-## Konfigurace
-
-| Proměnná / property | Služba | Výchozí | Význam |
-|---|---|---|---|
-| `KAFKA_BOOTSTRAP_SERVERS` | všechny | `localhost:9092` | adresa brokeru (v K8s `kafka:9092`) |
-| `DB_URL` / `DB_USERNAME` / `DB_PASSWORD` | order, payment | `jdbc:postgresql://localhost:5432/eda`, `<služba>_service` | připojení k DB (heslo v K8s ze Secretu služby) |
-| `PAYMENT_FAILURE_RATE` | payment | `0.2` | pravděpodobnost zamítnutí platby (0–1) |
-| `PAYMENT_POISON_AMOUNT` | payment | `666` | částka vyvolávající technickou chybu → retry → DLT |
-| `eda.inbox.max-attempts` | obě | `4` | pokusů o zpracování (1 + 3 retry) před DLT |
-| `eda.inbox.initial-backoff` / `multiplier` / `max-backoff` | obě | `500ms` / `2.0` / `5s` | exponenciální backoff inboxu |
-| `eda.inbox.poll-interval-ms` / `eda.outbox.poll-interval-ms` | obě | `500` | perioda processoru / relaye |
-| `EDA_CLEANUP_RETENTION_DAYS` (`eda.cleanup.retention-days`) | obě | `7` | úklid maže dokončené inbox a publikované outbox zprávy starší než N dní |
-| `EDA_CLEANUP_CRON` (`eda.cleanup.cron`) | obě | `0 0 3 * * *` | kdy úklid běží (Spring cron, denně 03:00) |
-| `eda.cleanup.batch-size` | obě | `1000` | řádků na jeden DELETE (krátké zámky) |
-| `eda.kafka.retry.*` | order, payment | 3× od `500ms` | retry na úrovni Kafky – jen pro uložení do inboxu (výpadek DB) |
-| `eda.kafka.retry.*` | order-process | 3× od `500ms` | retry `publishMessage` do Zeebe (order-process nemá inbox); po vyčerpání zpráva do DLT |
-| `eda.kafka.topics.partitions` | všechny | `3` | partitions vytvářených topiců |
-| `eda.process.message-ttl` | order-process | `1h` | TTL zpráv publikovaných do Zeebe; musí přesáhnout timeout jobu (5 min) + čas na řešení incidentu, jinak předčasný `PaymentResult` vyprší a instance čeká donekonečna; je to i okno deduplikace `messageId` |
-| `CAMUNDA_REST_ADDRESS` | order-process | `http://camunda:8080` (K8s) | REST adresa Camundy |
-| `CAMUNDA_GRPC_ADDRESS` | order-process | `http://camunda:26500` (K8s) | gRPC adresa Camundy – gRPC je skutečně používaný protokol klienta (`prefer-rest-over-grpc: false`, kvůli kódu `ALREADY_EXISTS`) |
-
-V K8s jsou hodnoty v ConfigMapách `order-service-config`, `payment-service-config` a `order-process-config`.
-
-## Úklid
-
-```bash
-./scripts/teardown.sh              # nebo .\scripts\teardown.ps1 – smaže namespace eda-demo vč. dat DB a RBAC
-minikube delete                    # smaže celý cluster
-```
-
-## Struktura repozitáře
-
-```
-order-service/            samostatný Maven projekt + Dockerfile (domain, api, inbox, outbox, messaging)
-payment-service/          samostatný Maven projekt + Dockerfile (domain, inbox, outbox, messaging)
-order-process/            orchestrátor: Maven projekt + Dockerfile (BPMN, listenery, workery, CommandPublisher), bez DB
-pom.xml                   jen agregátor (mvn verify nad všemi službami), služby od něj nic nedědí
-k8s/base/                 namespace, Kafka, PostgreSQL, Camunda, order-service, payment-service, order-process
-k8s/components/           volitelné: monitoring (Prometheus, Grafana), logging (ES, Kibana, Fluent Bit)
-k8s/overlays/             profily monitoring, logging, full
-scripts/                  build-images, deploy, teardown, port-forward, send-orders (.sh + .ps1)
-```
-
-## Co bylo ověřeno
-
-**Orchestrace přes Camundu (2026-10-08):** e2e test `order-process/src/test/java/cz/demo/eda/process/OrderProcessIntegrationTest.java`
-běží proti reálné Kafce a Zeebe (Camunda Process Test). Nasazení na Kubernetes (docker-desktop) ověřeno
-také: teardown + build-images + deploy proběhly, 6/6 podů Ready; 10 objednávek → 9× `PAID`, 1× `PAYMENT_FAILED`
-(míra selhání 0.2); částka 666 → `PENDING_PAYMENT`, instance `ACTIVE` na `payment_result` v Camundě a
-payment-service zalogoval záznam z `payments.commands.DLT`; v logech jen dvě očekávané `ERROR` řádky
-(poison); Camunda search API ukazuje 10× `COMPLETED` + 1× `ACTIVE`; špička paměti Camundy ~550 MB z limitu
-1536Mi; Prometheus endpoint na portu 9600 odpovídá.
-
-**Choreografická verze před přechodem na Camundu (2026-10-07)** – níže uvedené výsledky platí pro ni
-(tok `orders.created` → payment-service → `payments.result` → order-service):
-
-| Ověřeno | Jak |
-|---|---|
-| Unit, repository a integrační testy | `mvn clean install` – 187 testů (order 94, payment 93), 0 selhání; repository testy `@DataJpaTest` proti PostgreSQL; Testcontainers `postgres:18.6-alpine` + `apache/kafka:4.3.1` |
-| Deploy profilu `base` | Kubernetes v Docker Desktopu (v1.32): Kafka, PostgreSQL, obě služby Ready za ~30 s, 0 restartů |
-| E2E tok | 9 objednávek: 7× `PAID`, 1× `PAYMENT_FAILED` (simulované zamítnutí), poison 666 zůstala `PENDING_PAYMENT` |
-| Inbox/outbox v DB | všechny outbox řádky publikované; inboxy `PROCESSED`; poison zpráva `FAILED` po 4 pokusech s chybou v `last_error`, její DLT zpráva odeslaná |
-| Izolace schémat | `order_service` na `payments.payments` → `permission denied for schema payments` |
-| Flyway migrace nad existující DB | V2 (indexy pro úklid) se aplikovala při redeployi |
-| Úklid | po zestárnutí 4+4 řádků o 8 dní a cronu každou minutu smazáno přesně 4 inbox + 4 outbox v každé službě, čerstvé řádky zůstaly (ověřeno na JDBC verzi; JPA verze pokrytá testy) |
-| JPA verze v clusteru | Hibernate validace schématu proti DB z Flyway prošla; 9 objednávek: 6× `PAID`, 2× `PAYMENT_FAILED`, poison `FAILED` po 4 pokusech → DLT, žádná platba po rollbacku, outbox prázdný |
-
-Profily `monitoring`, `logging` a `full` jsou po restrukturalizaci ověřené jen renderem
-(`kubectl kustomize`); v předchozí verzi projektu (bez DB) byl plný stack nasazený a ověřený E2E.
-Neověřeno: běh na **minikube** (na testovacím stroji není nainstalovaný).
+Vrstvy testů, Camunda Process Test a historie ověření (včetně nasazení na Kubernetes):
+[kapitola 10](docs/poznamky/10_testovanie.md).
 
 ## Omezení demo řešení
 

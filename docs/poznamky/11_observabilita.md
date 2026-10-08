@@ -203,15 +203,15 @@ Count Name
 | `logging` | Elasticsearch, Kibana, Fluent Bit (DaemonSet) | centralizované logy, index `eda-logs-*`, data view **EDA logs** | Kibana http://localhost:5601 → Discover |
 | `full` | všetko | | |
 
-Nasadenie (README): `.\scripts\deploy.ps1 -Stack monitoring` / `-Stack logging` / `-Stack full`. Počítaj s ~2 GB RAM navyše pre `full`.
+Nasadenie: `.\scripts\deploy.ps1 -Stack monitoring` / `-Stack logging` / `-Stack full` (bash: `./scripts/deploy.sh monitoring|logging|full`). Profily sú Kustomize overlaye (`k8s/overlays/*`), ktoré skladajú `k8s/base` a komponenty `k8s/components/{monitoring,logging}` – observabilitu teda pridáš kedykoľvek ďalším `deploy` s iným profilom. Počítaj s ~2 GB RAM navyše pre `full`. Elasticsearch je po port-forwarde na http://localhost:9200.
 
 Panely dashboardu (z [`eda-overview.json`](../../k8s/components/monitoring/grafana/eda-overview.json)): HTTP request rate, HTTP latency p50/p95/p99, Messages produced / consumed (msg/s), Consumer lag, Dead-lettered messages, DLT rate & duplicates skipped, JVM heap a non-heap.
 
-Kibana dotazy z README: `correlationId : "demo-…"`, `log.level : "ERROR"`.
+Kibana dotazy (Discover, data view *EDA logs*): `correlationId : "demo-…"`, `log.level : "ERROR"`.
 
-> **Pozor:** Fluent Bit v [`fluent-bit.yaml`](../../k8s/components/logging/fluent-bit.yaml) zbiera len súbory `order-service-*` a `payment-service-*`. Logy `order-process` sa do Elasticsearch **nedostanú**, takže v Kibane by cesta objednávky podľa `correlationId` neobsahovala kroky orchestrátora (README tvrdí „přes všechny tři služby“). PowerShell postup z kroku 1 ich obsahuje.
+> **Pozor:** Fluent Bit v [`fluent-bit.yaml`](../../k8s/components/logging/fluent-bit.yaml) zbiera len súbory `order-service-*` a `payment-service-*`. Logy `order-process` sa do Elasticsearch **nedostanú**, takže v Kibane by cesta objednávky podľa `correlationId` neobsahovala kroky orchestrátora – tie ukáže `kubectl -n eda-demo logs deploy/order-process`. PowerShell postup z kroku 1 ich obsahuje.
 
-**Neoverené:** profily `monitoring`, `logging` a `full` som pri písaní nenasadzoval (zákaz deployu). README uvádza, že po reštrukturalizácii sú overené len renderom (`kubectl kustomize`).
+**Neoverené:** profily `monitoring`, `logging` a `full` som pri písaní nenasadzoval (zákaz deployu). Po reštrukturalizácii sú overené len renderom (`kubectl kustomize`), pozri históriu overenia v [kapitole 10](10_testovanie.md#4-čo-bolo-overené-pri-vývoji).
 
 ---
 

@@ -77,6 +77,7 @@ Výstup (skrátený, pre každú z troch služieb to isté):
 
 - `--mount=type=cache,target=/root/.m2` – Maven repozitár sa medzi buildmi cachuje, druhý build je rýchly.
 - Posledný riadok: pri kontexte `docker-desktop` sa nič do minikube nenahráva.
+- Image sa nikam nepushujú (žiadna registry): Docker Desktop ich vidí priamo, do minikube ich skript nahrá cez `minikube image load` ([kapitola 02](02_predpoklady_a_setup.md)).
 
 ### 3. Deploy
 
@@ -185,7 +186,7 @@ Test-NetConnection localhost -Port 15432 -InformationLevel Quiet
 True
 ```
 
-V DBeaveri potom: `jdbc:postgresql://localhost:15432/eda`, používateľ `order_service`, heslo podľa README (`order-service-demo`). Heslá sú demo hodnoty v manifeste [`postgres.yaml`](../../k8s/base/postgres/postgres.yaml). Pripojenie z DBeaveru som pri písaní neskúšal (na stroji nie je), port som overil cez `Test-NetConnection` a SQL dotazy v kapitolách bežia cez `psql` priamo v pode.
+V DBeaveri potom: `jdbc:postgresql://localhost:15432/eda`, používateľ `order_service`, heslo `order-service-demo`. Heslá sú demo hodnoty v manifeste [`postgres.yaml`](../../k8s/base/postgres/postgres.yaml). Pripojenie z DBeaveru som pri písaní neskúšal (na stroji nie je), port som overil cez `Test-NetConnection` a SQL dotazy v kapitolách bežia cez `psql` priamo v pode.
 
 ### 5. Health check
 
@@ -286,6 +287,36 @@ Tá jedna `ACTIVE` je objednávka so sumou 666 z prvého overenia – zámerne �
 
 Skripty v PS 5.1 nepoužívajú `$ErrorActionPreference = 'Stop'` (okrem `send-orders.ps1`), lebo PS 5.1 by bral stderr natívnych príkazov (`docker build` píše priebeh na stderr) ako chybu. Namiesto toho kontrolujú `$LASTEXITCODE`.
 
+Bash varianty pre Git Bash / Linux / macOS: `./scripts/build-images.sh`, `./scripts/deploy.sh [monitoring|logging|full]`, `./scripts/port-forward.sh`, `./scripts/send-orders.sh 20` (poison: `./scripts/send-orders.sh 1 666`), `./scripts/teardown.sh`. Ručná objednávka v bash:
+
+```bash
+curl -i -X POST localhost:8080/orders -H 'Content-Type: application/json' \
+  -H 'X-Correlation-Id: my-test-1' -d '{"customerId":"c1","amount":99.90,"currency":"CZK"}'
+```
+
+### Konfigurácia služieb
+
+V Kubernetes sú hodnoty v ConfigMapách `order-service-config`, `payment-service-config` a `order-process-config`; lokálne platia predvolené hodnoty z `application.yml`.
+
+| Premenná / property | Služba | Predvolené | Význam |
+|---|---|---|---|
+| `KAFKA_BOOTSTRAP_SERVERS` | všetky | `localhost:9092` | adresa brokera (v K8s `kafka:9092`) |
+| `DB_URL` / `DB_USERNAME` / `DB_PASSWORD` | order, payment | `jdbc:postgresql://localhost:5432/eda`, `<služba>_service` | pripojenie k DB (heslo v K8s zo Secretu služby) |
+| `PAYMENT_FAILURE_RATE` | payment | `0.2` | pravdepodobnosť zamietnutia platby (0–1) |
+| `PAYMENT_POISON_AMOUNT` | payment | `666` | suma, ktorá vyvolá technickú chybu → retry → DLT |
+| `eda.inbox.max-attempts` | obe | `4` | pokusov o spracovanie (1 + 3 retry) pred DLT |
+| `eda.inbox.initial-backoff` / `multiplier` / `max-backoff` | obe | `500ms` / `2.0` / `5s` | exponenciálny backoff inboxu |
+| `eda.inbox.poll-interval-ms` / `eda.outbox.poll-interval-ms` | obe | `500` | perióda processora / relaye |
+| `EDA_CLEANUP_RETENTION_DAYS` (`eda.cleanup.retention-days`) | obe | `7` | úklid maže dokončené inbox a publikované outbox správy staršie ako N dní |
+| `EDA_CLEANUP_CRON` (`eda.cleanup.cron`) | obe | `0 0 3 * * *` | kedy úklid beží (Spring cron, denne o 03:00) |
+| `eda.cleanup.batch-size` | obe | `1000` | riadkov na jeden `DELETE` (krátke zámky) |
+| `eda.kafka.retry.*` | order, payment | 3× od `500ms` | retry na úrovni Kafky – len pre uloženie do inboxu (výpadok DB) |
+| `eda.kafka.retry.*` | order-process | 3× od `500ms` | retry `publishMessage` do Zeebe (order-process nemá inbox); po vyčerpaní správa do DLT |
+| `eda.kafka.topics.partitions` | všetky | `3` | partície vytváraných topicov |
+| `eda.process.message-ttl` | order-process | `1h` | TTL správ publikovaných do Zeebe; musí presiahnuť timeout jobu (5 min) + čas na riešenie incidentu ([kapitola 08](08_most_zeebe_kafka.md)); je to aj okno deduplikácie `messageId` |
+| `CAMUNDA_REST_ADDRESS` | order-process | `http://camunda:8080` (K8s) | REST adresa Camundy |
+| `CAMUNDA_GRPC_ADDRESS` | order-process | `http://camunda:26500` (K8s) | gRPC adresa Camundy – gRPC je protokol, ktorý klient skutočne používa (`prefer-rest-over-grpc: false`, kvôli kódu `ALREADY_EXISTS`, [kapitola 06](06_camunda_a_zeebe.md)) |
+
 ---
 
 ## Bez Camundy by to vyzeralo takto
@@ -301,7 +332,7 @@ V `ba78d05` deploy čakal len na `postgres` a `kafka` a bežalo **5** podov (bez
 | `Unable to listen on port 5432` | Port drží lokálny PostgreSQL | `kubectl -n eda-demo port-forward svc/postgres 15432:5432` |
 | `curl.exe localhost:8082` zrazu nefunguje | Pod `order-process` sa reštartoval (nový image, scale) a port-forward na neho spadol | Ukonči a spusti `port-forward.ps1` znova |
 | `order-process` dlho v `Init:0/1` | initContainer čaká na Kafku a Zeebe (`nc -z camunda 26500`) | Počkaj na `camunda-0` (štart ~20–60 s); `kubectl -n eda-demo logs <pod> -c wait-for-dependencies` |
-| Po deployi do starého clustra Camunda padá na DB | Databáza `camunda` neexistuje – init skript PostgreSQL beží len nad prázdnym PVC | `.\scripts\teardown.ps1` a nový deploy (README, „Upgrade existujícího prostředí“) |
+| Po deployi do starého clustra Camunda padá na DB | Databáza `camunda` neexistuje – init skript PostgreSQL beží len nad prázdnym PVC | `.\scripts\teardown.ps1` (zmaže namespace vrátane dát DB) a nový deploy |
 | Pod v `ErrImageNeverPull` | Image `:dev` neexistuje lokálne (`imagePullPolicy: Never`) | `.\scripts\build-images.ps1` |
 | Operate prihlásenie cez `curl` vráti `401` | UI má vlastný login flow | Prihlás sa v prehliadači, na skripty používaj REST API `/v2/...` |
 

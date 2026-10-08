@@ -13,34 +13,30 @@
 
 ### 1. Dva smery mostu
 
-Zeebe nevie nič o Kafke a Kafka nič o Zeebe. `order-process` je **tlmočník** medzi nimi:
+Zeebe nevie nič o Kafke a Kafka nič o Zeebe. Tok riadi **Zeebe** (drží stav inštancie, vytvára joby, vyberá vetvu gateway, čaká na správy). `order-process` je len **tlmočník** medzi Kafkou a Zeebe – sám o ničom nerozhoduje:
 
 ```mermaid
 flowchart LR
-    subgraph Kafka
-        T1[(orders.created)]
-        T3[(payments.result)]
-        T2[(payments.commands)]
-        T4[(orders.commands)]
+    T1[(orders.created)] --> L1[OrderCreatedListener]
+    T3[(payments.result)] --> L2[PaymentResultListener]
+    subgraph OP["order-process (most)"]
+        L1 --> GW[ProcessGateway]
+        L2 --> GW
+        subgraph WK[job workery]
+            W1[RequestPaymentWorker]
+            W2[ConfirmOrderWorker]
+            W3[CancelOrderWorker]
+        end
+        WK --> CP[CommandPublisher]
     end
-    subgraph OP[order-process]
-        L1[OrderCreatedListener]
-        L2[PaymentResultListener]
-        GW[ProcessGateway]
-        W1[RequestPaymentWorker]
-        W2[ConfirmOrderWorker]
-        W3[CancelOrderWorker]
-        CP[CommandPublisher]
-    end
-    Z[Zeebe]
-    T1 --> L1 --> GW
-    T3 --> L2 --> GW
-    GW -- "publishMessage (gRPC)" --> Z
-    Z -- "job (ActivateJobs)" --> W1 & W2 & W3
-    W1 & W2 & W3 --> CP
-    CP --> T2
-    CP --> T4
+    GW -- "publishMessage (gRPC)" --> Z["Zeebe – riadi tok<br/>(stav, joby, gateway)"]
+    Z == "job request-payment /<br/>confirm-order / cancel-order<br/>(worker si ho vyzdvihne – pull)" ==> WK
+    WK -. "completeJob<br/>po odoslaní príkazu" .-> Z
+    CP --> T2[(payments.commands)]
+    CP --> T4[(orders.commands)]
 ```
+
+Všetky šípky k Zeebe vychádzajú z `order-process`: aj joby si workery **vyzdvihujú** samy (pull). Zeebe len rozhodne, aký job vznikne a kedy, a čaká, kým si ho niekto vezme. Časovú postupnosť tých istých krokov ukazuje sekvenčný diagram v [README](../../README.md#architektura) a v [kapitole 06](06_camunda_a_zeebe.md).
 
 | Smer | Vstup | Kto | Výstup |
 |---|---|---|---|

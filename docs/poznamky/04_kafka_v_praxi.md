@@ -91,7 +91,7 @@ payments.result.DLT
 ```
 
 - `__consumer_offsets` je interný topic, kde Kafka ukladá offsety consumer groups.
-- Všetky ostatné vytvorili **služby** pri štarte (`KafkaAdmin.NewTopics` v `KafkaConfig#edaTopics`). Broker má `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`, takže preklep v názve topicu skončí chybou, nie novým prázdnym topicom.
+- Všetky ostatné vytvorili **služby** pri štarte (`KafkaAdmin.NewTopics` v `KafkaConfig#edaTopics`). Každá služba zakladá topicy, ktoré produkuje alebo konzumuje, a DLT svojich konzumentov: `payments.commands.DLT` (payment-service), `orders.commands.DLT` (order-service), `orders.created.DLT` a `payments.result.DLT` (order-process). Broker má `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`, takže preklep v názve topicu skončí chybou, nie novým prázdnym topicom.
 
 ### 2. Detail topicu
 
@@ -144,7 +144,7 @@ Ako to čítať:
 - Rozdelenie objednávok do partícií nie je rovnomerné (6/4/10) – rozhoduje hash `orderId`.
 - Posledný riadok je len informačná hláška Kafka 4.x o novom rebalance protokole, demo ho nepoužíva.
 
-Všetky skupiny naraz (README používa tento príkaz):
+Všetky skupiny naraz:
 
 ```powershell
 kubectl -n eda-demo exec deploy/kafka -- /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
