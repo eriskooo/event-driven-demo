@@ -49,7 +49,7 @@ spring:
       properties:
         spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
-        spring.json.value.default.type: cz.demo.eda.payment.event.OrderCreated
+        spring.json.value.default.type: cz.demo.eda.payment.event.ProcessPayment
         spring.json.use.type.headers: false
         spring.json.trusted.packages: cz.demo.eda.payment.event
     listener:

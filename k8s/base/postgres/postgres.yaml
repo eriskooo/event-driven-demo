@@ -1,5 +1,6 @@
 # Jedna PostgreSQL instance, databáze "eda"; každá služba má vlastní schéma a vlastního uživatele,
 # který do cizího schématu nemá přístup. Hesla jsou demo hodnoty – v produkci External Secrets apod.
+# Camunda má vlastní databázi camunda. Init skript běží jen nad prázdným PVC – po upgradu existujícího prostředí je nutný teardown.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -25,6 +26,14 @@ stringData:
   password: payment-service-demo
 ---
 apiVersion: v1
+kind: Secret
+metadata:
+  name: camunda-db
+type: Opaque
+stringData:
+  password: camunda-demo
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: postgres-init
@@ -34,7 +43,8 @@ data:
     #!/bin/sh
     set -eu
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
-         -v order_pw="$ORDER_DB_PASSWORD" -v payment_pw="$PAYMENT_DB_PASSWORD" <<'EOSQL'
+         -v order_pw="$ORDER_DB_PASSWORD" -v payment_pw="$PAYMENT_DB_PASSWORD" \
+         -v camunda_pw="$CAMUNDA_DB_PASSWORD" <<'EOSQL'
     CREATE ROLE order_service LOGIN PASSWORD :'order_pw';
     CREATE ROLE payment_service LOGIN PASSWORD :'payment_pw';
     -- Schéma vlastní služba; cizí role na něj nemá USAGE, takže do něj nevidí.
@@ -42,6 +52,10 @@ data:
     CREATE SCHEMA payments AUTHORIZATION payment_service;
     REVOKE ALL ON DATABASE eda FROM PUBLIC;
     GRANT CONNECT ON DATABASE eda TO order_service, payment_service;
+    -- Camunda (vedlejší úložiště pro Operate) má vlastní databázi; schéma si zakládá sama.
+    CREATE ROLE camunda LOGIN PASSWORD :'camunda_pw';
+    CREATE DATABASE camunda OWNER camunda;
+    REVOKE ALL ON DATABASE camunda FROM PUBLIC;
     EOSQL
 ---
 apiVersion: apps/v1
@@ -65,7 +79,7 @@ spec:
         - name: postgres
           image: postgres:18.6-alpine
           # Úsporné nastavení pro laptop (výchozí shared_buffers 128MB by se nevešel do limitu).
-          args: ["-c", "shared_buffers=32MB", "-c", "max_connections=40"]
+          args: ["-c", "shared_buffers=32MB", "-c", "max_connections=60"]
           ports:
             - name: postgres
               containerPort: 5432
@@ -89,6 +103,11 @@ spec:
                 secretKeyRef:
                   name: payment-service-db
                   key: password
+            - name: CAMUNDA_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: camunda-db
+                  key: password
           volumeMounts:
             # PostgreSQL 18 image ukládá data do /var/lib/postgresql/18/docker – mountuje se nadřazený adresář.
             - name: data
@@ -98,10 +117,10 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
+              memory: 192Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 384Mi
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "postgres", "-d", "eda"]

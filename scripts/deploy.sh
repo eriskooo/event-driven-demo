@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Nasadí stack do namespace eda-demo a počká na rollout.
-# Použití: deploy.sh [base|monitoring|logging|full]   (výchozí base = Kafka, PostgreSQL, obě služby)
+# Použití: deploy.sh [base|monitoring|logging|full]   (výchozí base = Kafka, PostgreSQL, Camunda, služby)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,8 +17,8 @@ echo ">> Deploying profile '${PROFILE}' (${TARGET})"
 kubectl apply -k "${TARGET}"
 
 # Infrastruktura první – služby na ni čekají v initContaineru.
-for workload in statefulset/postgres deployment/kafka; do
-  kubectl -n "${NS}" rollout status "${workload}" --timeout=300s
+for workload in statefulset/postgres deployment/kafka statefulset/camunda; do
+  kubectl -n "${NS}" rollout status "${workload}" --timeout=600s
 done
 for workload in $(kubectl -n "${NS}" get deployment,daemonset -o name); do
   echo ">> Waiting for ${workload}"

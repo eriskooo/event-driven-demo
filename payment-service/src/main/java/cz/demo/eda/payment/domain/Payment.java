@@ -1,6 +1,6 @@
 package cz.demo.eda.payment.domain;
 
-import cz.demo.eda.payment.event.OrderCreated;
+import cz.demo.eda.payment.event.ProcessPayment;
 import cz.demo.eda.payment.event.PaymentCompleted;
 import cz.demo.eda.payment.event.PaymentFailed;
 import cz.demo.eda.payment.event.PaymentResult;
@@ -64,7 +64,7 @@ public class Payment extends AssignedIdEntity<String> {
     }
 
     /** Sestaví záznam platby z objednávky a výsledku simulace. */
-    public static Payment of(OrderCreated order, PaymentResult result, Instant now) {
+    public static Payment of(ProcessPayment order, PaymentResult result, Instant now) {
         return switch (result) {
             case PaymentCompleted completed -> new Payment(completed.paymentId(), order.orderId(),
                     PaymentStatus.COMPLETED, order.amount(), order.currency(), null, now);

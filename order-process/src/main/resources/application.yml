@@ -1,0 +1,79 @@
+spring:
+  application:
+    name: order-process
+  # Virtuální vlákna vypnutá ze stejného důvodu jako v ostatních službách (pinning Kafka consumeru na Java 21).
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    admin:
+      fail-fast: true
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      properties:
+        enable.idempotence: true
+        spring.json.add.type.headers: false
+    consumer:
+      group-id: order-process
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        # Výchozí typ nastavuje každý listener sám (dva topicy, dva typy).
+        spring.json.use.type.headers: false
+        spring.json.trusted.packages: cz.demo.eda.process.event
+    listener:
+      # Offset se commitne až po úspěšném publishMessage do Zeebe.
+      ack-mode: record
+      concurrency: 3
+
+camunda:
+  client:
+    mode: self-managed
+    auth:
+      method: none
+    rest-address: ${CAMUNDA_REST_ADDRESS:http://localhost:8088}
+    grpc-address: ${CAMUNDA_GRPC_ADDRESS:http://localhost:26500}
+    # gRPC kvůli jednoznačnému kódu ALREADY_EXISTS při duplicitním messageId (ProcessGateway).
+    prefer-rest-over-grpc: false
+
+eda:
+  process:
+    # Musí přesáhnout timeout jobu (5 min) + čas na řešení incidentu, viz ProcessProperties.
+    message-ttl: 1h
+  kafka:
+    topics:
+      partitions: 3
+      replicas: 1
+    retry:
+      max-retries: 3
+      initial-interval: 500ms
+      multiplier: 2.0
+      max-interval: 5s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  structured:
+    format:
+      console: ecs
+    ecs:
+      service:
+        name: ${spring.application.name}

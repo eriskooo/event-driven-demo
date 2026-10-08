@@ -1,6 +1,6 @@
 package cz.demo.eda.payment.domain;
 
-import cz.demo.eda.payment.event.OrderCreated;
+import cz.demo.eda.payment.event.ProcessPayment;
 import cz.demo.eda.payment.event.PaymentResult;
 import cz.demo.eda.payment.outbox.OutboxPublisher;
 import cz.demo.eda.payment.support.Topics;
@@ -31,12 +31,12 @@ public class PaymentService {
     }
 
     /**
-     * Provede platbu, uloží ji a zařadí výsledek do outboxu – vše v jedné transakci
+     * Provede platbu za objednávku z příkazu orchestrátoru, uloží ji a zařadí výsledek do outboxu – vše v jedné transakci
      * (volá ji InboxService, deduplikaci už zajistil inbox).
      *
      * @throws PaymentProcessingException technická chyba (poison částka) – inbox ji zopakuje, pak DLT
      */
-    public PaymentResult processPayment(OrderCreated order) {
+    public PaymentResult processPayment(ProcessPayment order) {
         log.info("Processing payment for order {} amount {} {}", order.orderId(), order.amount(), order.currency());
         PaymentResult result = simulator.process(order);
         repository.save(Payment.of(order, result, clock.instant()));

@@ -1,0 +1,661 @@
+# Review package: snapshot t7 -> t8 (uncommitted working tree; user commits manually)
+
+## Files changed
+ .../snap-t8/k8s/base/camunda/camunda.yaml          | 159 +++++++++++++++++++++
+ .../k8s/base/kustomization.yaml                    |   6 +-
+ .../k8s/base/order-process/order-process.yaml      | 103 +++++++++++++
+ .../k8s/base/postgres/postgres.yaml                |  27 +++-
+ .../{snap-t7 => snap-t8}/scripts/build-images.ps1  |   6 +-
+ .../{snap-t7 => snap-t8}/scripts/build-images.sh   |   6 +-
+ .../{snap-t7 => snap-t8}/scripts/deploy.ps1        |   6 +-
+ .../{snap-t7 => snap-t8}/scripts/deploy.sh         |   6 +-
+ .../{snap-t7 => snap-t8}/scripts/port-forward.ps1  |   2 +
+ .../{snap-t7 => snap-t8}/scripts/port-forward.sh   |   2 +
+ 10 files changed, 306 insertions(+), 17 deletions(-)
+
+## Diff
+diff --git a/k8s/base/camunda/camunda.yaml b/k8s/base/camunda/camunda.yaml
+new file mode 100644
+index 0000000..6f1f03c
+--- /dev/null
++++ b/k8s/base/camunda/camunda.yaml
+@@ -0,0 +1,159 @@
++# Camunda 8 Orchestration Cluster (Zeebe + Operate + Tasklist v jednom kontejneru), 1 broker.
++# Primární úložiště (log událostí + RocksDB) je na PVC – to je zdroj pravdy o běžících instancích.
++# Vedlejší úložiště pro Operate/Tasklist/search API je databáze "camunda" v PostgreSQL (plní ji exportér).
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: camunda-config
++  labels:
++    app.kubernetes.io/name: camunda
++data:
++  application.yaml: |
++    camunda:
++      system:
++        cpu-thread-count: "2"
++        io-thread-count: "2"
++      security:
++        authentication:
++          method: basic
++          # Workery a listenery v namespace se připojují bez přihlášení – jen pro demo.
++          unprotectedApi: true
++        authorizations:
++          enabled: false
++        initialization:
++          users:
++            - username: demo
++              password: demo
++              name: Demo User
++              email: demo@demo.com
++          defaultRoles.admin.users:
++            - demo
++      data:
++        secondary-storage:
++          type: rdbms
++          rdbms:
++            url: jdbc:postgresql://postgres:5432/camunda
++            username: camunda
++            password: ${CAMUNDA_DB_PASSWORD}
++---
++apiVersion: apps/v1
++kind: StatefulSet
++metadata:
++  name: camunda
++  labels:
++    app.kubernetes.io/name: camunda
++spec:
++  serviceName: camunda
++  replicas: 1
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: camunda
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: camunda
++        app.kubernetes.io/part-of: eda-demo
++      annotations:
++        prometheus.io/scrape: "true"
++        prometheus.io/path: /actuator/prometheus
++        prometheus.io/port: "9600"
++    spec:
++      securityContext:
++        # Image běží jako uživatel 1001 – PVC musí být zapisovatelné pro jeho skupinu.
++        fsGroup: 1001
++      initContainers:
++        - name: wait-for-postgres
++          image: busybox:1.37.0
++          command: ["sh", "-c", "until nc -z postgres 5432; do echo waiting for postgres; sleep 2; done"]
++          resources:
++            requests:
++              cpu: 10m
++              memory: 16Mi
++            limits:
++              cpu: 50m
++              memory: 32Mi
++      containers:
++        - name: camunda
++          image: camunda/camunda:8.10.2
++          ports:
++            - name: http
++              containerPort: 8080
++            - name: grpc
++              containerPort: 26500
++            - name: management
++              containerPort: 9600
++          env:
++            - name: CAMUNDA_DB_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: camunda-db
++                  key: password
++            - name: JAVA_TOOL_OPTIONS
++              value: -XX:MaxRAMPercentage=60 -XX:+ExitOnOutOfMemoryError
++          volumeMounts:
++            - name: data
++              mountPath: /usr/local/camunda/data
++            - name: config
++              mountPath: /usr/local/camunda/config/application.yaml
++              subPath: application.yaml
++          resources:
++            requests:
++              cpu: 250m
++              memory: 1Gi
++            limits:
++              cpu: "2"
++              memory: 1536Mi
++          startupProbe:
++            httpGet:
++              path: /actuator/health/liveness
++              port: management
++            timeoutSeconds: 3
++            periodSeconds: 5
++            failureThreshold: 60
++          livenessProbe:
++            httpGet:
++              path: /actuator/health/liveness
++              port: management
++            timeoutSeconds: 3
++            periodSeconds: 15
++            failureThreshold: 3
++          readinessProbe:
++            httpGet:
++              path: /actuator/health/readiness
++              port: management
++            timeoutSeconds: 3
++            periodSeconds: 5
++            failureThreshold: 3
++      volumes:
++        - name: config
++          configMap:
++            name: camunda-config
++  # Běžící instance procesů přežijí restart podu; smaže je až teardown (smazání namespace).
++  volumeClaimTemplates:
++    - metadata:
++        name: data
++      spec:
++        accessModes: [ReadWriteOnce]
++        resources:
++          requests:
++            storage: 1Gi
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: camunda
++  labels:
++    app.kubernetes.io/name: camunda
++spec:
++  selector:
++    app.kubernetes.io/name: camunda
++  ports:
++    - name: http
++      port: 8080
++      targetPort: http
++    - name: grpc
++      port: 26500
++      targetPort: grpc
++    - name: management
++      port: 9600
++      targetPort: management
+diff --git a/k8s/base/kustomization.yaml b/k8s/base/kustomization.yaml
+index 8ed2e20..153cbd5 100644
+--- a/k8s/base/kustomization.yaml
++++ b/k8s/base/kustomization.yaml
+@@ -1,25 +1,29 @@
+-# Základní deploy: Kafka, PostgreSQL a obě služby. Observabilitu přidávají overlaye v ../overlays.
++# Základní deploy: Kafka, PostgreSQL, Camunda a tři služby. Observabilitu přidávají overlaye v ../overlays.
+ apiVersion: kustomize.config.k8s.io/v1beta1
+ kind: Kustomization
+ 
+ namespace: eda-demo
+ 
+ labels:
+   - pairs:
+       app.kubernetes.io/part-of: eda-demo
+     includeSelectors: false
+ 
+ resources:
+   - namespace.yaml
+   - kafka/kafka.yaml
+   - postgres/postgres.yaml
++  - camunda/camunda.yaml
+   - order-service/order-service.yaml
+   - payment-service/payment-service.yaml
++  - order-process/order-process.yaml
+ 
+ # Image se buildí lokálně (imagePullPolicy: Never); tag lze přepsat např.
+ # `kustomize edit set image order-service=order-service:1.2.3`.
+ images:
+   - name: order-service
+     newTag: dev
+   - name: payment-service
+     newTag: dev
++  - name: order-process
++    newTag: dev
+diff --git a/k8s/base/order-process/order-process.yaml b/k8s/base/order-process/order-process.yaml
+new file mode 100644
+index 0000000..4f56b91
+--- /dev/null
++++ b/k8s/base/order-process/order-process.yaml
+@@ -0,0 +1,103 @@
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: order-process-config
++  labels:
++    app.kubernetes.io/name: order-process
++data:
++  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
++  CAMUNDA_REST_ADDRESS: http://camunda:8080
++  CAMUNDA_GRPC_ADDRESS: http://camunda:26500
++  # Heap jen 60 % limitu – zbytek potřebuje metaspace, vlákna, gRPC a direct buffery Kafka klienta.
++  JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60 -XX:+ExitOnOutOfMemoryError
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: order-process
++  labels:
++    app.kubernetes.io/name: order-process
++spec:
++  replicas: 1
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: order-process
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: order-process
++        app.kubernetes.io/part-of: eda-demo
++      annotations:
++        prometheus.io/scrape: "true"
++        prometheus.io/path: /actuator/prometheus
++        prometheus.io/port: "8080"
++    spec:
++      terminationGracePeriodSeconds: 30
++      initContainers:
++        # Čeká na Kafku a Zeebe: KafkaAdmin při startu vytváří topicy a @Deployment nasazuje BPMN –
++        # bez nich by pod skončil v CrashLoopBackOff s rostoucí prodlevou restartů.
++        - name: wait-for-dependencies
++          image: busybox:1.37.0
++          command: ["sh", "-c", "until nc -z kafka 9092 && nc -z camunda 26500; do echo waiting for kafka and camunda; sleep 2; done"]
++          resources:
++            requests:
++              cpu: 10m
++              memory: 16Mi
++            limits:
++              cpu: 50m
++              memory: 32Mi
++      containers:
++        - name: order-process
++          image: order-process:dev
++          imagePullPolicy: Never
++          ports:
++            - name: http
++              containerPort: 8080
++          envFrom:
++            - configMapRef:
++                name: order-process-config
++          resources:
++            requests:
++              cpu: 100m
++              memory: 384Mi
++            limits:
++              cpu: "1"
++              memory: 512Mi
++          startupProbe:
++            httpGet:
++              path: /actuator/health/liveness
++              port: http
++            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
++            timeoutSeconds: 3
++            periodSeconds: 5
++            failureThreshold: 36
++          livenessProbe:
++            httpGet:
++              path: /actuator/health/liveness
++              port: http
++            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
++            timeoutSeconds: 3
++            periodSeconds: 10
++            failureThreshold: 3
++          readinessProbe:
++            httpGet:
++              path: /actuator/health/readiness
++              port: http
++            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
++            timeoutSeconds: 3
++            periodSeconds: 5
++            failureThreshold: 3
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: order-process
++  labels:
++    app.kubernetes.io/name: order-process
++spec:
++  selector:
++    app.kubernetes.io/name: order-process
++  ports:
++    - name: http
++      port: 8080
++      targetPort: http
+diff --git a/k8s/base/postgres/postgres.yaml b/k8s/base/postgres/postgres.yaml
+index 1cb25f0..251e316 100644
+--- a/k8s/base/postgres/postgres.yaml
++++ b/k8s/base/postgres/postgres.yaml
+@@ -1,12 +1,13 @@
+ # Jedna PostgreSQL instance, databáze "eda"; každá služba má vlastní schéma a vlastního uživatele,
+ # který do cizího schématu nemá přístup. Hesla jsou demo hodnoty – v produkci External Secrets apod.
++# Camunda má vlastní databázi camunda. Init skript běží jen nad prázdným PVC – po upgradu existujícího prostředí je nutný teardown.
+ apiVersion: v1
+ kind: Secret
+ metadata:
+   name: postgres-admin
+ type: Opaque
+ stringData:
+   password: postgres-demo
+ ---
+ apiVersion: v1
+ kind: Secret
+@@ -18,37 +19,50 @@ stringData:
+ ---
+ apiVersion: v1
+ kind: Secret
+ metadata:
+   name: payment-service-db
+ type: Opaque
+ stringData:
+   password: payment-service-demo
+ ---
+ apiVersion: v1
++kind: Secret
++metadata:
++  name: camunda-db
++type: Opaque
++stringData:
++  password: camunda-demo
++---
++apiVersion: v1
+ kind: ConfigMap
+ metadata:
+   name: postgres-init
+ data:
+   # Spouští se jen při inicializaci prázdného datového adresáře.
+   01-service-schemas.sh: |
+     #!/bin/sh
+     set -eu
+     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+-         -v order_pw="$ORDER_DB_PASSWORD" -v payment_pw="$PAYMENT_DB_PASSWORD" <<'EOSQL'
++         -v order_pw="$ORDER_DB_PASSWORD" -v payment_pw="$PAYMENT_DB_PASSWORD" \
++         -v camunda_pw="$CAMUNDA_DB_PASSWORD" <<'EOSQL'
+     CREATE ROLE order_service LOGIN PASSWORD :'order_pw';
+     CREATE ROLE payment_service LOGIN PASSWORD :'payment_pw';
+     -- Schéma vlastní služba; cizí role na něj nemá USAGE, takže do něj nevidí.
+     CREATE SCHEMA orders AUTHORIZATION order_service;
+     CREATE SCHEMA payments AUTHORIZATION payment_service;
+     REVOKE ALL ON DATABASE eda FROM PUBLIC;
+     GRANT CONNECT ON DATABASE eda TO order_service, payment_service;
++    -- Camunda (vedlejší úložiště pro Operate) má vlastní databázi; schéma si zakládá sama.
++    CREATE ROLE camunda LOGIN PASSWORD :'camunda_pw';
++    CREATE DATABASE camunda OWNER camunda;
++    REVOKE ALL ON DATABASE camunda FROM PUBLIC;
+     EOSQL
+ ---
+ apiVersion: apps/v1
+ kind: StatefulSet
+ metadata:
+   name: postgres
+   labels:
+     app.kubernetes.io/name: postgres
+ spec:
+   serviceName: postgres
+@@ -58,21 +72,21 @@ spec:
+       app.kubernetes.io/name: postgres
+   template:
+     metadata:
+       labels:
+         app.kubernetes.io/name: postgres
+     spec:
+       containers:
+         - name: postgres
+           image: postgres:18.6-alpine
+           # Úsporné nastavení pro laptop (výchozí shared_buffers 128MB by se nevešel do limitu).
+-          args: ["-c", "shared_buffers=32MB", "-c", "max_connections=40"]
++          args: ["-c", "shared_buffers=32MB", "-c", "max_connections=60"]
+           ports:
+             - name: postgres
+               containerPort: 5432
+           env:
+             - name: POSTGRES_DB
+               value: eda
+             - name: POSTGRES_USER
+               value: postgres
+             - name: POSTGRES_PASSWORD
+               valueFrom:
+@@ -82,33 +96,38 @@ spec:
+             - name: ORDER_DB_PASSWORD
+               valueFrom:
+                 secretKeyRef:
+                   name: order-service-db
+                   key: password
+             - name: PAYMENT_DB_PASSWORD
+               valueFrom:
+                 secretKeyRef:
+                   name: payment-service-db
+                   key: password
++            - name: CAMUNDA_DB_PASSWORD
++              valueFrom:
++                secretKeyRef:
++                  name: camunda-db
++                  key: password
+           volumeMounts:
+             # PostgreSQL 18 image ukládá data do /var/lib/postgresql/18/docker – mountuje se nadřazený adresář.
+             - name: data
+               mountPath: /var/lib/postgresql
+             - name: init
+               mountPath: /docker-entrypoint-initdb.d
+           resources:
+             requests:
+               cpu: 100m
+-              memory: 128Mi
++              memory: 192Mi
+             limits:
+               cpu: 500m
+-              memory: 256Mi
++              memory: 384Mi
+           readinessProbe:
+             exec:
+               command: ["pg_isready", "-U", "postgres", "-d", "eda"]
+             periodSeconds: 5
+             timeoutSeconds: 3
+           livenessProbe:
+             exec:
+               command: ["pg_isready", "-U", "postgres", "-d", "eda"]
+             initialDelaySeconds: 30
+             periodSeconds: 15
+diff --git a/scripts/build-images.ps1 b/scripts/build-images.ps1
+index 5298604..99d6191 100644
+--- a/scripts/build-images.ps1
++++ b/scripts/build-images.ps1
+@@ -1,28 +1,28 @@
+-# Sestaví Docker image obou služeb a nahraje je do minikube (bez registry).
++# Sestaví Docker image všech služeb a nahraje je do minikube (bez registry).
+ # Bez 'Stop': PS 5.1 by stderr nativních příkazů (průběh docker buildu) bral jako chybu; kontroluje se $LASTEXITCODE.
+ 
+ $root = Split-Path -Parent $PSScriptRoot
+ $tag = if ($env:IMAGE_TAG) { $env:IMAGE_TAG } else { 'dev' }
+ 
+ # Docker Desktop Kubernetes sdílí image s lokálním Dockerem – načítání do minikube tam odpadá.
+ $context = kubectl config current-context 2>$null
+ $useMinikube = $context -ne 'docker-desktop'
+ 
+-foreach ($service in 'order-service', 'payment-service') {
++foreach ($service in 'order-service', 'payment-service', 'order-process') {
+     Write-Host ">> Building ${service}:${tag}"
+     docker build -t "${service}:${tag}" (Join-Path $root $service)
+     if ($LASTEXITCODE -ne 0) { throw "docker build of $service failed" }
+     if (-not $useMinikube) { continue }
+ 
+     Write-Host ">> Loading ${service}:${tag} into minikube"
+     # --overwrite: jinak by minikube ponechal starý image se stejným tagem.
+     minikube image load --overwrite=true "${service}:${tag}"
+     if ($LASTEXITCODE -ne 0) { throw "minikube image load of $service failed" }
+ }
+ 
+ if ($useMinikube) {
+     Write-Host '>> Done. Images in minikube:'
+-    minikube image ls | Select-String -Pattern '(order|payment)-service'
++    minikube image ls | Select-String -Pattern '(order|payment)-(service|process)'
+ } else {
+     Write-Host '>> Done. Context docker-desktop uses local Docker images directly.'
+ }
+diff --git a/scripts/build-images.sh b/scripts/build-images.sh
+index 3211002..85875ff 100644
+--- a/scripts/build-images.sh
++++ b/scripts/build-images.sh
+@@ -1,29 +1,29 @@
+ #!/usr/bin/env bash
+-# Sestaví Docker image obou služeb a nahraje je do minikube (bez registry).
++# Sestaví Docker image všech služeb a nahraje je do minikube (bez registry).
+ set -euo pipefail
+ 
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ TAG="${IMAGE_TAG:-dev}"
+ 
+ # Docker Desktop Kubernetes sdílí image s lokálním Dockerem – načítání do minikube tam odpadá.
+ CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+ 
+-for service in order-service payment-service; do
++for service in order-service payment-service order-process; do
+   echo ">> Building ${service}:${TAG}"
+   # Build z adresáře služby s kontextem "." – absolutní cesta /c/... by v Git Bash s MSYS_NO_PATHCONV=1
+   # pro Windows docker.exe neexistovala.
+   (cd "${ROOT}/${service}" && docker build -t "${service}:${TAG}" .)
+   if [[ "${CONTEXT}" == "docker-desktop" ]]; then
+     continue
+   fi
+   echo ">> Loading ${service}:${TAG} into minikube"
+   # --overwrite: jinak by minikube ponechal starý image se stejným tagem.
+   minikube image load --overwrite=true "${service}:${TAG}"
+ done
+ 
+ if [[ "${CONTEXT}" == "docker-desktop" ]]; then
+   echo ">> Done. Context docker-desktop uses local Docker images directly."
+ else
+   echo ">> Done. Images in minikube:"
+-  minikube image ls | grep -E '(order|payment)-service' || true
++  minikube image ls | grep -E '(order|payment)-(service|process)' || true
+ fi
+diff --git a/scripts/deploy.ps1 b/scripts/deploy.ps1
+index 7af80b6..6cd7b46 100644
+--- a/scripts/deploy.ps1
++++ b/scripts/deploy.ps1
+@@ -1,34 +1,34 @@
+ # Nasadí stack do namespace eda-demo a počká na rollout.
+-# Použití: .\deploy.ps1 [-Stack base|monitoring|logging|full]   (výchozí base = Kafka, PostgreSQL, obě služby)
++# Použití: .\deploy.ps1 [-Stack base|monitoring|logging|full]   (výchozí base = Kafka, PostgreSQL, Camunda, služby)
+ # ($Profile nelze – je to vestavěná proměnná PowerShellu.)
+ param(
+     [ValidateSet('base', 'monitoring', 'logging', 'full')]
+     [string] $Stack = 'base'
+ )
+ # Bez 'Stop': PS 5.1 by stderr nativních příkazů bral jako chybu; kontroluje se $LASTEXITCODE.
+ 
+ $root = Split-Path -Parent $PSScriptRoot
+ $ns = 'eda-demo'
+ $target = if ($Stack -eq 'base') { Join-Path $root 'k8s\base' } else { Join-Path (Join-Path $root 'k8s\overlays') $Stack }
+ 
+ function Invoke-Checked([scriptblock] $command, [string] $what) {
+     & $command
+     if ($LASTEXITCODE -ne 0) { throw "$what failed" }
+ }
+ 
+ Write-Host ">> Deploying profile '$Stack' ($target)"
+ Invoke-Checked { kubectl apply -k $target } 'kubectl apply'
+ 
+ # Infrastruktura první – služby na ni čekají v initContaineru.
+-foreach ($workload in 'statefulset/postgres', 'deployment/kafka') {
+-    Invoke-Checked { kubectl -n $ns rollout status $workload --timeout=300s } "rollout of $workload"
++foreach ($workload in 'statefulset/postgres', 'deployment/kafka', 'statefulset/camunda') {
++    Invoke-Checked { kubectl -n $ns rollout status $workload --timeout=600s } "rollout of $workload"
+ }
+ foreach ($workload in (kubectl -n $ns get deployment,daemonset -o name)) {
+     Write-Host ">> Waiting for $workload"
+     Invoke-Checked { kubectl -n $ns rollout status $workload --timeout=600s } "rollout of $workload"
+ }
+ kubectl -n $ns get job kibana-setup 2>$null | Out-Null
+ if ($LASTEXITCODE -eq 0) {
+     Write-Host '>> Waiting for Kibana data view job'
+     Invoke-Checked { kubectl -n $ns wait --for=condition=complete job/kibana-setup --timeout=600s } 'kibana-setup job'
+ }
+diff --git a/scripts/deploy.sh b/scripts/deploy.sh
+index dba1d65..d0434d5 100644
+--- a/scripts/deploy.sh
++++ b/scripts/deploy.sh
+@@ -1,31 +1,31 @@
+ #!/usr/bin/env bash
+ # Nasadí stack do namespace eda-demo a počká na rollout.
+-# Použití: deploy.sh [base|monitoring|logging|full]   (výchozí base = Kafka, PostgreSQL, obě služby)
++# Použití: deploy.sh [base|monitoring|logging|full]   (výchozí base = Kafka, PostgreSQL, Camunda, služby)
+ set -euo pipefail
+ 
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ NS=eda-demo
+ PROFILE="${1:-base}"
+ 
+ case "${PROFILE}" in
+   base) TARGET="${ROOT}/k8s/base" ;;
+   monitoring|logging|full) TARGET="${ROOT}/k8s/overlays/${PROFILE}" ;;
+   *) echo "Unknown profile '${PROFILE}', use base|monitoring|logging|full" >&2; exit 1 ;;
+ esac
+ 
+ echo ">> Deploying profile '${PROFILE}' (${TARGET})"
+ kubectl apply -k "${TARGET}"
+ 
+ # Infrastruktura první – služby na ni čekají v initContaineru.
+-for workload in statefulset/postgres deployment/kafka; do
+-  kubectl -n "${NS}" rollout status "${workload}" --timeout=300s
++for workload in statefulset/postgres deployment/kafka statefulset/camunda; do
++  kubectl -n "${NS}" rollout status "${workload}" --timeout=600s
+ done
+ for workload in $(kubectl -n "${NS}" get deployment,daemonset -o name); do
+   echo ">> Waiting for ${workload}"
+   kubectl -n "${NS}" rollout status "${workload}" --timeout=600s
+ done
+ if kubectl -n "${NS}" get job kibana-setup >/dev/null 2>&1; then
+   echo ">> Waiting for Kibana data view job"
+   kubectl -n "${NS}" wait --for=condition=complete job/kibana-setup --timeout=600s
+ fi
+ 
+diff --git a/scripts/port-forward.ps1 b/scripts/port-forward.ps1
+index 01d148d..12ba38b 100644
+--- a/scripts/port-forward.ps1
++++ b/scripts/port-forward.ps1
+@@ -1,15 +1,17 @@
+ # Zpřístupní na localhostu služby, které jsou v namespace eda-demo nasazené. Ctrl+C ukončí vše.
+ $ns = 'eda-demo'
+ $forwards = @(
+     @('order-service', '8080:8080', 'http://localhost:8080/orders'),
+     @('payment-service', '8081:8080', 'http://localhost:8081/actuator/health'),
++    @('order-process', '8082:8080', 'http://localhost:8082/actuator/health'),
++    @('camunda', '8088:8080', 'http://localhost:8088/operate (demo/demo)'),
+     @('postgres', '5432:5432', 'jdbc:postgresql://localhost:5432/eda'),
+     @('grafana', '3000:3000', 'http://localhost:3000 (admin/admin)'),
+     @('prometheus', '9090:9090', 'http://localhost:9090'),
+     @('kibana', '5601:5601', "http://localhost:5601 (data view 'EDA logs')"),
+     @('elasticsearch', '9200:9200', 'http://localhost:9200')
+ )
+ 
+ $processes = @()
+ foreach ($f in $forwards) {
+     # Volitelné komponenty (monitoring, logging) nemusí být nasazené.
+diff --git a/scripts/port-forward.sh b/scripts/port-forward.sh
+index 6f6ae49..f7ce8f2 100644
+--- a/scripts/port-forward.sh
++++ b/scripts/port-forward.sh
+@@ -1,19 +1,21 @@
+ #!/usr/bin/env bash
+ # Zpřístupní na localhostu služby, které jsou v namespace eda-demo nasazené. Ctrl+C ukončí vše.
+ set -euo pipefail
+ 
+ NS=eda-demo
+ # služba  lokální:vzdálený port  popis
+ FORWARDS=(
+   "order-service   8080:8080  http://localhost:8080/orders"
+   "payment-service 8081:8080  http://localhost:8081/actuator/health"
++  "order-process   8082:8080  http://localhost:8082/actuator/health"
++  "camunda         8088:8080  http://localhost:8088/operate (demo/demo)"
+   "postgres        5432:5432  jdbc:postgresql://localhost:5432/eda"
+   "grafana         3000:3000  http://localhost:3000 (admin/admin)"
+   "prometheus      9090:9090  http://localhost:9090"
+   "kibana          5601:5601  http://localhost:5601 (data view 'EDA logs')"
+   "elasticsearch   9200:9200  http://localhost:9200"
+ )
+ 
+ pids=()
+ cleanup() { kill "${pids[@]}" 2>/dev/null || true; }
+ trap cleanup EXIT INT TERM

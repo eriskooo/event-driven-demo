@@ -1,0 +1,1222 @@
+# Review package: snapshot t0 -> t1 (uncommitted working tree; user commits manually)
+
+## Files changed
+ .../{snap-t0 => snap-t1}/payment-service/pom.xml   |  2 +-
+ .../cz/demo/eda/payment/config/KafkaConfig.java    |  8 ++--
+ .../java/cz/demo/eda/payment/domain/Payment.java   |  4 +-
+ .../cz/demo/eda/payment/domain/PaymentService.java |  6 +--
+ .../demo/eda/payment/domain/PaymentSimulator.java  |  4 +-
+ .../cz/demo/eda/payment/event/ProcessPayment.java} | 15 +++-----
+ .../eda/payment/messaging/DeadLetterListener.java  |  4 +-
+ .../payment/messaging/ProcessPaymentHandler.java}  | 10 ++---
+ .../payment/messaging/ProcessPaymentListener.java} | 32 ++++++++--------
+ .../java/cz/demo/eda/payment/support/Topics.java   |  2 +-
+ .../src/main/resources/application.yml             |  2 +-
+ .../eda/payment/PaymentServiceIntegrationTest.java | 43 ++++++++++++++--------
+ .../eda/payment/domain/PaymentServiceTest.java     | 12 +++---
+ .../eda/payment/domain/PaymentSimulatorTest.java   |  8 ++--
+ .../cz/demo/eda/payment/domain/PaymentTest.java    |  4 +-
+ .../eda/payment/event/EventSerializationTest.java  | 10 ++---
+ .../payment/messaging/DeadLetterListenerTest.java  |  4 +-
+ .../messaging/ProcessPaymentHandlerTest.java}      | 14 +++----
+ .../messaging/ProcessPaymentListenerTest.java}     | 32 ++++++++--------
+ .../eda/payment/outbox/OutboxPublisherTest.java    | 16 ++++----
+ .../cz/demo/eda/payment/support/TopicsTest.java    |  2 +-
+ 21 files changed, 121 insertions(+), 113 deletions(-)
+
+## Diff
+diff --git a/payment-service/pom.xml b/payment-service/pom.xml
+index fe3b84d..83889f9 100644
+--- a/payment-service/pom.xml
++++ b/payment-service/pom.xml
+@@ -8,21 +8,21 @@
+         <groupId>org.springframework.boot</groupId>
+         <artifactId>spring-boot-starter-parent</artifactId>
+         <version>4.1.1</version>
+         <relativePath/>
+     </parent>
+ 
+     <groupId>cz.demo.eda</groupId>
+     <artifactId>payment-service</artifactId>
+     <version>0.0.1-SNAPSHOT</version>
+     <name>payment-service</name>
+-    <description>Simuluje platby pro vytvořené objednávky</description>
++    <description>Simuluje platby na příkaz orchestrátoru a publikuje jejich výsledek</description>
+ 
+     <properties>
+         <java.version>21</java.version>
+     </properties>
+ 
+     <dependencies>
+         <dependency>
+             <groupId>org.springframework.boot</groupId>
+             <artifactId>spring-boot-starter-webmvc</artifactId>
+         </dependency>
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/config/KafkaConfig.java b/payment-service/src/main/java/cz/demo/eda/payment/config/KafkaConfig.java
+index 3cd4283..3acb5b6 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/config/KafkaConfig.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/config/KafkaConfig.java
+@@ -16,46 +16,46 @@ import org.springframework.kafka.core.KafkaAdmin;
+ import org.springframework.kafka.core.KafkaOperations;
+ import org.springframework.kafka.core.KafkaTemplate;
+ import org.springframework.kafka.core.ProducerFactory;
+ import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+ import org.springframework.kafka.listener.DefaultErrorHandler;
+ import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
+ 
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ 
+-/** Topicy, retry s backoffem a dead letter topic pro konzumenta orders.created. */
++/** Topicy, retry s backoffem a dead letter topic pro konzumenta payments.commands. */
+ @Configuration(proxyBeanMethods = false)
+ public class KafkaConfig {
+ 
+     private static final Logger log = LoggerFactory.getLogger(KafkaConfig.class);
+ 
+     /**
+      * Topicy, které služba produkuje nebo konzumuje, plus DLT svého konzumenta.
+      * KafkaAdmin je vytvoří při startu; existující topicy nechá být.
+      */
+     @Bean
+     KafkaAdmin.NewTopics edaTopics(EdaKafkaProperties properties) {
+         EdaKafkaProperties.Topics settings = properties.topics();
+         return new KafkaAdmin.NewTopics(
+-                topic(Topics.ORDERS_CREATED, settings),
++                topic(Topics.PAYMENTS_COMMANDS, settings),
+                 topic(Topics.PAYMENTS_RESULT, settings),
+                 // DLT má stejný počet partitions, aby recoverer mohl zachovat číslo partition.
+-                topic(Topics.dltOf(Topics.ORDERS_CREATED), settings));
++                topic(Topics.dltOf(Topics.PAYMENTS_COMMANDS), settings));
+     }
+ 
+     /** Error handler: retry s exponenciálním backoffem, poté publikace do &lt;topic&gt;.DLT. */
+     @Bean
+     DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<Object, Object> kafkaTemplate,
+                                           ProducerFactory<Object, Object> producerFactory,
+                                           EdaKafkaProperties properties, MessagingMetrics metrics) {
+-        metrics.deadLetterCounter(Topics.dltOf(Topics.ORDERS_CREATED));
++        metrics.deadLetterCounter(Topics.dltOf(Topics.PAYMENTS_COMMANDS));
+         DeadLetterPublishingRecoverer recoverer = deadLetterRecoverer(kafkaTemplate, producerFactory);
+         DefaultErrorHandler handler = new DefaultErrorHandler((record, ex) -> {
+             recoverer.accept(record, ex);
+             metrics.deadLettered(Topics.dltOf(record.topic()));
+             log.error("Record {}-{}@{} moved to {} after retries", record.topic(), record.partition(),
+                     record.offset(), Topics.dltOf(record.topic()), ex);
+         }, backOff(properties.retry()));
+         handler.setRetryListeners((record, ex, attempt) -> log.warn("Delivery attempt {} of record {}-{}@{} failed: {}",
+                 attempt, record.topic(), record.partition(), record.offset(), ex.getMessage()));
+         // Při MANUAL_IMMEDIATE listener zprávu nepotvrdil – offset zprávy odeslané do DLT musí commitnout handler.
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/domain/Payment.java b/payment-service/src/main/java/cz/demo/eda/payment/domain/Payment.java
+index d225658..80dd408 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/domain/Payment.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/domain/Payment.java
+@@ -1,13 +1,13 @@
+ package cz.demo.eda.payment.domain;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.event.PaymentCompleted;
+ import cz.demo.eda.payment.event.PaymentFailed;
+ import cz.demo.eda.payment.event.PaymentResult;
+ import cz.demo.eda.payment.support.jpa.AssignedIdEntity;
+ import jakarta.persistence.Column;
+ import jakarta.persistence.Entity;
+ import jakarta.persistence.EnumType;
+ import jakarta.persistence.Enumerated;
+ import jakarta.persistence.Id;
+ import jakarta.persistence.Table;
+@@ -57,21 +57,21 @@ public class Payment extends AssignedIdEntity<String> {
+         this.id = Objects.requireNonNull(id, "id");
+         this.orderId = Objects.requireNonNull(orderId, "orderId");
+         this.status = Objects.requireNonNull(status, "status");
+         this.amount = amount;
+         this.currency = currency;
+         this.failureReason = failureReason;
+         this.createdAt = createdAt;
+     }
+ 
+     /** Sestaví záznam platby z objednávky a výsledku simulace. */
+-    public static Payment of(OrderCreated order, PaymentResult result, Instant now) {
++    public static Payment of(ProcessPayment order, PaymentResult result, Instant now) {
+         return switch (result) {
+             case PaymentCompleted completed -> new Payment(completed.paymentId(), order.orderId(),
+                     PaymentStatus.COMPLETED, order.amount(), order.currency(), null, now);
+             case PaymentFailed failed -> new Payment(UUID.randomUUID().toString(), order.orderId(),
+                     PaymentStatus.FAILED, order.amount(), order.currency(), failed.reason(), now);
+         };
+     }
+ 
+     @Override
+     public String getId() {
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/domain/PaymentService.java b/payment-service/src/main/java/cz/demo/eda/payment/domain/PaymentService.java
+index fdd7f95..3ad1c6a 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/domain/PaymentService.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/domain/PaymentService.java
+@@ -1,13 +1,13 @@
+ package cz.demo.eda.payment.domain;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.event.PaymentResult;
+ import cz.demo.eda.payment.outbox.OutboxPublisher;
+ import cz.demo.eda.payment.support.Topics;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.time.Clock;
+ 
+@@ -24,24 +24,24 @@ public class PaymentService {
+     private final Clock clock;
+ 
+     public PaymentService(PaymentSimulator simulator, PaymentRepository repository, OutboxPublisher outbox, Clock clock) {
+         this.simulator = simulator;
+         this.repository = repository;
+         this.outbox = outbox;
+         this.clock = clock;
+     }
+ 
+     /**
+-     * Provede platbu, uloží ji a zařadí výsledek do outboxu – vše v jedné transakci
++     * Provede platbu za objednávku z příkazu orchestrátoru, uloží ji a zařadí výsledek do outboxu – vše v jedné transakci
+      * (volá ji InboxService, deduplikaci už zajistil inbox).
+      *
+      * @throws PaymentProcessingException technická chyba (poison částka) – inbox ji zopakuje, pak DLT
+      */
+-    public PaymentResult processPayment(OrderCreated order) {
++    public PaymentResult processPayment(ProcessPayment order) {
+         log.info("Processing payment for order {} amount {} {}", order.orderId(), order.amount(), order.currency());
+         PaymentResult result = simulator.process(order);
+         repository.save(Payment.of(order, result, clock.instant()));
+         outbox.publish(Topics.PAYMENTS_RESULT, result);
+         log.info("Payment for order {} finished with {}", order.orderId(), result.getClass().getSimpleName());
+         return result;
+     }
+ }
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/domain/PaymentSimulator.java b/payment-service/src/main/java/cz/demo/eda/payment/domain/PaymentSimulator.java
+index 95a45fb..5d1e469 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/domain/PaymentSimulator.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/domain/PaymentSimulator.java
+@@ -1,13 +1,13 @@
+ package cz.demo.eda.payment.domain;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.event.PaymentCompleted;
+ import cz.demo.eda.payment.event.PaymentFailed;
+ import cz.demo.eda.payment.event.PaymentResult;
+ import org.springframework.stereotype.Component;
+ 
+ import java.util.UUID;
+ import java.util.random.RandomGenerator;
+ 
+ /** Simuluje platební bránu: náhodné zamítnutí podle failure-rate a "otrávená" částka pro demo DLT. */
+ @Component
+@@ -21,21 +21,21 @@ public class PaymentSimulator {
+     public PaymentSimulator(PaymentProperties properties, RandomGenerator random) {
+         this.properties = properties;
+         this.random = random;
+     }
+ 
+     /**
+      * Zpracuje platbu za objednávku.
+      *
+      * @throws PaymentProcessingException pokud částka odpovídá nastavené poison částce
+      */
+-    public PaymentResult process(OrderCreated order) {
++    public PaymentResult process(ProcessPayment order) {
+         if (order.amount().compareTo(properties.poisonAmount()) == 0) {
+             throw new PaymentProcessingException("Simulated gateway crash for poison amount " + order.amount()
+                     + " (order " + order.orderId() + ")");
+         }
+         if (random.nextDouble() < properties.failureRate()) {
+             return PaymentFailed.of(order.correlationId(), order.orderId(), DECLINED_REASON);
+         }
+         return PaymentCompleted.of(order.correlationId(), order.orderId(), UUID.randomUUID().toString(), order.amount());
+     }
+ }
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/event/OrderCreated.java b/payment-service/src/main/java/cz/demo/eda/payment/event/ProcessPayment.java
+similarity index 52%
+rename from payment-service/src/main/java/cz/demo/eda/payment/event/OrderCreated.java
+rename to payment-service/src/main/java/cz/demo/eda/payment/event/ProcessPayment.java
+index 54824bb..34263bf 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/event/OrderCreated.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/event/ProcessPayment.java
+@@ -1,31 +1,28 @@
+ package cz.demo.eda.payment.event;
+ 
+ import java.math.BigDecimal;
+ import java.time.Instant;
+ import java.util.Objects;
+ import java.util.UUID;
+ 
+-/** Událost publikovaná order-service po založení objednávky. */
+-public record OrderCreated(
++/** Příkaz od orchestrátoru order-process: proveď platbu za objednávku. */
++public record ProcessPayment(
+         UUID eventId,
+         Instant timestamp,
+         String correlationId,
+         String orderId,
+-        String customerId,
+         BigDecimal amount,
+         String currency) implements DomainEvent {
+ 
+-    public OrderCreated {
++    public ProcessPayment {
+         Objects.requireNonNull(eventId, "eventId");
+         Objects.requireNonNull(timestamp, "timestamp");
+         Objects.requireNonNull(orderId, "orderId");
+         Objects.requireNonNull(amount, "amount");
+     }
+ 
+-    /** Vytvoří novou událost s vygenerovaným eventId a aktuálním časem. */
+-    public static OrderCreated of(String correlationId, String orderId, String customerId,
+-                                  BigDecimal amount, String currency) {
+-        return new OrderCreated(UUID.randomUUID(), Instant.now(), correlationId, orderId,
+-                customerId, amount, currency);
++    /** Vytvoří nový příkaz s vygenerovaným eventId a aktuálním časem. */
++    public static ProcessPayment of(String correlationId, String orderId, BigDecimal amount, String currency) {
++        return new ProcessPayment(UUID.randomUUID(), Instant.now(), correlationId, orderId, amount, currency);
+     }
+ }
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/messaging/DeadLetterListener.java b/payment-service/src/main/java/cz/demo/eda/payment/messaging/DeadLetterListener.java
+index 3e1b782..7178185 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/messaging/DeadLetterListener.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/messaging/DeadLetterListener.java
+@@ -16,24 +16,24 @@ import java.nio.charset.StandardCharsets;
+ 
+ /**
+  * Čte DLT jen pro zviditelnění v logu. Do DLT vedou dvě cesty: Kafka error handler (nečitelná zpráva,
+  * hlavičky kafka_dlt-*) a inbox po vyčerpání pokusů (hlavičky eda-dlt-*). Vlastní consumer group,
+  * hodnota jako text, protože může jít o nevalidní JSON.
+  */
+ @Component
+ public class DeadLetterListener {
+ 
+     private static final Logger log = LoggerFactory.getLogger(DeadLetterListener.class);
+-    private static final String DLT_TOPIC = Topics.ORDERS_CREATED + Topics.DLT_SUFFIX;
++    private static final String DLT_TOPIC = Topics.PAYMENTS_COMMANDS + Topics.DLT_SUFFIX;
+ 
+     /** Zaloguje zprávu z DLT včetně důvodu selhání. */
+-    @KafkaListener(id = "order-created-dlt-listener", idIsGroup = false, topics = DLT_TOPIC, groupId = "payment-service-dlt",
++    @KafkaListener(id = "process-payment-dlt-listener", idIsGroup = false, topics = DLT_TOPIC, groupId = "payment-service-dlt",
+             properties = "value.deserializer=org.apache.kafka.common.serialization.StringDeserializer")
+     public void onDeadLetter(ConsumerRecord<String, String> record, Acknowledgment ack) {
+         Headers headers = record.headers();
+         log.error("Dead letter received: key={} originalTopic={} exception={} message={} attempts={} payload={}",
+                 record.key(),
+                 header(headers, KafkaHeaders.DLT_ORIGINAL_TOPIC, OutboxPublisher.DLT_ORIGINAL_TOPIC),
+                 header(headers, KafkaHeaders.DLT_EXCEPTION_FQCN, OutboxPublisher.DLT_EXCEPTION_FQCN),
+                 header(headers, KafkaHeaders.DLT_EXCEPTION_MESSAGE, OutboxPublisher.DLT_EXCEPTION_MESSAGE),
+                 header(headers, OutboxPublisher.DLT_ATTEMPTS), record.value());
+         ack.acknowledge();
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/messaging/OrderCreatedHandler.java b/payment-service/src/main/java/cz/demo/eda/payment/messaging/ProcessPaymentHandler.java
+similarity index 67%
+rename from payment-service/src/main/java/cz/demo/eda/payment/messaging/OrderCreatedHandler.java
+rename to payment-service/src/main/java/cz/demo/eda/payment/messaging/ProcessPaymentHandler.java
+index 0768a0f..468cbf6 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/messaging/OrderCreatedHandler.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/messaging/ProcessPaymentHandler.java
+@@ -1,26 +1,26 @@
+ package cz.demo.eda.payment.messaging;
+ 
+ import cz.demo.eda.payment.domain.PaymentService;
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.inbox.InboxEntry;
+ import cz.demo.eda.payment.inbox.InboxMessageHandler;
+ import org.springframework.stereotype.Component;
+ import tools.jackson.databind.json.JsonMapper;
+ 
+-/** Zpracuje vytvořenou objednávku uloženou v inboxu. */
++/** Zpracuje příkaz k platbě uložený v inboxu. */
+ @Component
+-public class OrderCreatedHandler implements InboxMessageHandler {
++public class ProcessPaymentHandler implements InboxMessageHandler {
+ 
+     private final PaymentService paymentService;
+     private final JsonMapper jsonMapper;
+ 
+-    public OrderCreatedHandler(PaymentService paymentService, JsonMapper jsonMapper) {
++    public ProcessPaymentHandler(PaymentService paymentService, JsonMapper jsonMapper) {
+         this.paymentService = paymentService;
+         this.jsonMapper = jsonMapper;
+     }
+ 
+     @Override
+     public void handle(InboxEntry entry) {
+-        paymentService.processPayment(jsonMapper.readValue(entry.payload(), OrderCreated.class));
++        paymentService.processPayment(jsonMapper.readValue(entry.payload(), ProcessPayment.class));
+     }
+ }
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/messaging/OrderCreatedListener.java b/payment-service/src/main/java/cz/demo/eda/payment/messaging/ProcessPaymentListener.java
+similarity index 51%
+rename from payment-service/src/main/java/cz/demo/eda/payment/messaging/OrderCreatedListener.java
+rename to payment-service/src/main/java/cz/demo/eda/payment/messaging/ProcessPaymentListener.java
+index 85bd2b5..fdf4761 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/messaging/OrderCreatedListener.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/messaging/ProcessPaymentListener.java
+@@ -1,62 +1,62 @@
+ package cz.demo.eda.payment.messaging;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.inbox.InboxEntry;
+ import cz.demo.eda.payment.inbox.InboxService;
+ import cz.demo.eda.payment.support.MessagingMetrics;
+ import cz.demo.eda.payment.support.Topics;
+ import cz.demo.eda.payment.support.Tracing;
+ import org.apache.kafka.clients.consumer.ConsumerRecord;
+ import org.apache.kafka.common.header.Header;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.kafka.annotation.KafkaListener;
+ import org.springframework.kafka.support.Acknowledgment;
+ import org.springframework.stereotype.Component;
+ import tools.jackson.databind.json.JsonMapper;
+ 
+ import java.nio.charset.StandardCharsets;
+ import java.time.Clock;
+ 
+ /**
+- * Přijímá vytvořené objednávky a jen je uloží do inboxu. Offset potvrdí ručně (AckMode.MANUAL_IMMEDIATE)
+- * až po úspěšném uložení; samotnou platbu s retry provede InboxProcessor.
++ * Přijímá příkazy k platbě od orchestrátoru a jen je uloží do inboxu. Offset potvrdí ručně
++ * (AckMode.MANUAL_IMMEDIATE) až po úspěšném uložení; samotnou platbu s retry provede InboxProcessor.
+  */
+ @Component
+-public class OrderCreatedListener {
++public class ProcessPaymentListener {
+ 
+-    private static final Logger log = LoggerFactory.getLogger(OrderCreatedListener.class);
++    private static final Logger log = LoggerFactory.getLogger(ProcessPaymentListener.class);
+ 
+     private final InboxService inbox;
+     private final JsonMapper jsonMapper;
+     private final MessagingMetrics metrics;
+     private final Clock clock;
+ 
+-    public OrderCreatedListener(InboxService inbox, JsonMapper jsonMapper, MessagingMetrics metrics, Clock clock) {
++    public ProcessPaymentListener(InboxService inbox, JsonMapper jsonMapper, MessagingMetrics metrics, Clock clock) {
+         this.inbox = inbox;
+         this.jsonMapper = jsonMapper;
+         this.metrics = metrics;
+         this.clock = clock;
+     }
+ 
+-    /** Uloží objednávku do inboxu a potvrdí offset; duplicitní eventId jen potvrdí. */
+-    @KafkaListener(id = "order-created-listener", idIsGroup = false, topics = Topics.ORDERS_CREATED)
+-    public void onOrderCreated(ConsumerRecord<String, OrderCreated> record, Acknowledgment ack) {
+-        OrderCreated event = record.value();
+-        boolean stored = inbox.store(InboxEntry.received(event.eventId(), record.topic(), record.key(),
+-                jsonMapper.writeValueAsString(event), correlationId(record, event), clock.instant()));
++    /** Uloží příkaz do inboxu a potvrdí offset; duplicitní eventId (opakovaný job v Zeebe) jen potvrdí. */
++    @KafkaListener(id = "process-payment-listener", idIsGroup = false, topics = Topics.PAYMENTS_COMMANDS)
++    public void onProcessPayment(ConsumerRecord<String, ProcessPayment> record, Acknowledgment ack) {
++        ProcessPayment command = record.value();
++        boolean stored = inbox.store(InboxEntry.received(command.eventId(), record.topic(), record.key(),
++                jsonMapper.writeValueAsString(command), correlationId(record, command), clock.instant()));
+         if (stored) {
+-            log.info("OrderCreated {} for order {} stored in inbox", event.eventId(), event.orderId());
++            log.info("ProcessPayment {} for order {} stored in inbox", command.eventId(), command.orderId());
+             metrics.consumed(record.topic(), MessagingMetrics.OUTCOME_STORED);
+         } else {
+-            log.info("Duplicate OrderCreated {} for order {} skipped", event.eventId(), event.orderId());
++            log.info("Duplicate ProcessPayment {} for order {} skipped", command.eventId(), command.orderId());
+             metrics.consumed(record.topic(), MessagingMetrics.OUTCOME_DUPLICATE);
+         }
+         ack.acknowledge();
+     }
+ 
+-    private static String correlationId(ConsumerRecord<?, ?> record, OrderCreated event) {
++    private static String correlationId(ConsumerRecord<?, ?> record, ProcessPayment command) {
+         Header header = record.headers().lastHeader(Tracing.CORRELATION_ID_HEADER);
+-        return header != null ? new String(header.value(), StandardCharsets.UTF_8) : event.correlationId();
++        return header != null ? new String(header.value(), StandardCharsets.UTF_8) : command.correlationId();
+     }
+ }
+diff --git a/payment-service/src/main/java/cz/demo/eda/payment/support/Topics.java b/payment-service/src/main/java/cz/demo/eda/payment/support/Topics.java
+index f8985d4..cb87edc 100644
+--- a/payment-service/src/main/java/cz/demo/eda/payment/support/Topics.java
++++ b/payment-service/src/main/java/cz/demo/eda/payment/support/Topics.java
+@@ -1,16 +1,16 @@
+ package cz.demo.eda.payment.support;
+ 
+ /** Názvy Kafka topiců – součást kontraktu s ostatními službami, musí odpovídat jejich konfiguraci. */
+ public final class Topics {
+ 
+-    public static final String ORDERS_CREATED = "orders.created";
++    public static final String PAYMENTS_COMMANDS = "payments.commands";
+     public static final String PAYMENTS_RESULT = "payments.result";
+     /** Suffix dead letter topiců; resolver v konzumentech jej používá explicitně. */
+     public static final String DLT_SUFFIX = ".DLT";
+ 
+     private Topics() {
+     }
+ 
+     /** Vrátí název dead letter topicu pro zadaný topic. */
+     public static String dltOf(String topic) {
+         return topic + DLT_SUFFIX;
+diff --git a/payment-service/src/main/resources/application.yml b/payment-service/src/main/resources/application.yml
+index 81abb2f..71301bb 100644
+--- a/payment-service/src/main/resources/application.yml
++++ b/payment-service/src/main/resources/application.yml
+@@ -42,21 +42,21 @@ spring:
+       group-id: payment-service
+       auto-offset-reset: earliest
+       enable-auto-commit: false
+       # ErrorHandlingDeserializer převede nečitelnou zprávu na výjimku, kterou error handler pošle do DLT,
+       # místo nekonečné smyčky v poll().
+       key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+       value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+       properties:
+         spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+-        spring.json.value.default.type: cz.demo.eda.payment.event.OrderCreated
++        spring.json.value.default.type: cz.demo.eda.payment.event.ProcessPayment
+         spring.json.use.type.headers: false
+         spring.json.trusted.packages: cz.demo.eda.payment.event
+     listener:
+       ack-mode: manual_immediate
+       concurrency: 3
+ 
+ payment:
+   failure-rate: ${PAYMENT_FAILURE_RATE:0.2}
+   poison-amount: ${PAYMENT_POISON_AMOUNT:666}
+ 
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/PaymentServiceIntegrationTest.java b/payment-service/src/test/java/cz/demo/eda/payment/PaymentServiceIntegrationTest.java
+index 76d880d..6a39e4c 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/PaymentServiceIntegrationTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/PaymentServiceIntegrationTest.java
+@@ -1,17 +1,17 @@
+ package cz.demo.eda.payment;
+ 
+ import cz.demo.eda.payment.domain.Payment;
+ import cz.demo.eda.payment.domain.PaymentRepository;
+ import cz.demo.eda.payment.domain.PaymentSimulator;
+ import cz.demo.eda.payment.domain.PaymentStatus;
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.inbox.InboxEntry;
+ import cz.demo.eda.payment.inbox.InboxRepository;
+ import cz.demo.eda.payment.inbox.InboxStatus;
+ import cz.demo.eda.payment.outbox.OutboxPublisher;
+ import cz.demo.eda.payment.support.MessagingMetrics;
+ import cz.demo.eda.payment.support.Topics;
+ import cz.demo.eda.payment.support.Tracing;
+ import io.micrometer.core.instrument.Counter;
+ import io.micrometer.core.instrument.MeterRegistry;
+ import org.apache.kafka.clients.admin.Admin;
+@@ -68,96 +68,107 @@ class PaymentServiceIntegrationTest {
+     @Autowired
+     private MeterRegistry registry;
+     @Autowired
+     private InboxRepository inbox;
+     @Autowired
+     private PaymentRepository payments;
+     @MockitoSpyBean
+     private PaymentSimulator simulator;
+ 
+     @Test
+-    @DisplayName("OrderCreated přes inbox a outbox vede k PaymentCompleted se stejným orderId a correlationId")
+-    void should_publishPaymentCompleted_whenOrderCreated() throws Exception {
+-        OrderCreated order = OrderCreated.of("it-corr-2", "order-ok", "cust", new BigDecimal("15.00"), "CZK");
++    @DisplayName("ProcessPayment přes inbox a outbox vede k PaymentCompleted se stejným orderId a correlationId")
++    void should_publishPaymentCompleted_whenProcessPayment() throws Exception {
++        ProcessPayment order = ProcessPayment.of("it-corr-2", "order-ok", new BigDecimal("15.00"), "CZK");
+ 
+         send(order);
+ 
+         ConsumerRecord<String, String> result = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(),
+                 Topics.PAYMENTS_RESULT, r -> "order-ok".equals(r.key()), TIMEOUT);
+         JsonNode json = jsonMapper.readTree(result.value());
+         assertThat(json.get("type").asString()).isEqualTo("PaymentCompleted");
+         assertThat(json.get("correlationId").asString()).isEqualTo("it-corr-2");
+         assertThat(KafkaTestSupport.header(result, Tracing.CORRELATION_ID_HEADER)).isEqualTo("it-corr-2");
+         assertThat(payments.findByOrderId("order-ok")).get().extracting(Payment::status).isEqualTo(PaymentStatus.COMPLETED);
+         assertThat(inboxStatus(order)).isEqualTo(InboxStatus.PROCESSED);
+     }
+ 
+     @Test
+-    @DisplayName("Duplicitní OrderCreated vytvoří jen jeden výsledek platby")
+-    void should_publishSingleResult_whenOrderCreatedDeliveredTwice() throws Exception {
+-        OrderCreated order = OrderCreated.of("it-corr-3", "order-dup", "cust", BigDecimal.TEN, "CZK");
++    @DisplayName("Duplicitní ProcessPayment vytvoří jen jeden výsledek platby")
++    void should_publishSingleResult_whenProcessPaymentDeliveredTwice() throws Exception {
++        ProcessPayment order = ProcessPayment.of("it-corr-3", "order-dup", BigDecimal.TEN, "CZK");
+ 
+         send(order);
+         send(order);
+ 
+         await().atMost(TIMEOUT).until(() -> counter(MessagingMetrics.CONSUMED, "outcome", "duplicate") >= 1);
+         List<ConsumerRecord<String, String>> results = KafkaTestSupport.collectRecords(kafka.getBootstrapServers(),
+                 Topics.PAYMENTS_RESULT, r -> "order-dup".equals(r.key()), Duration.ofSeconds(3));
+         assertThat(results).hasSize(1);
+     }
+ 
+     @Test
+     @DisplayName("Poison objednávka se v inboxu zkusí 4krát s backoffem, skončí v DLT a offset je hned potvrzený")
+     void should_retryInInboxThenDeadLetter_whenAmountIsPoison() throws Exception {
+-        OrderCreated order = OrderCreated.of("it-corr-4", "order-poison", "cust", new BigDecimal("666"), "CZK");
++        ProcessPayment order = ProcessPayment.of("it-corr-4", "order-poison", new BigDecimal("666"), "CZK");
+ 
+         send(order);
+ 
+         ConsumerRecord<String, String> dead = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(),
+-                Topics.dltOf(Topics.ORDERS_CREATED), r -> "order-poison".equals(r.key()), TIMEOUT);
++                Topics.dltOf(Topics.PAYMENTS_COMMANDS), r -> "order-poison".equals(r.key()), TIMEOUT);
+         assertThat(jsonMapper.readTree(dead.value()).get("orderId").asString()).isEqualTo("order-poison");
+         assertThat(KafkaTestSupport.header(dead, OutboxPublisher.DLT_EXCEPTION_FQCN)).endsWith("PaymentProcessingException");
+         assertThat(KafkaTestSupport.header(dead, OutboxPublisher.DLT_ATTEMPTS)).isEqualTo("4");
+         assertThat(KafkaTestSupport.header(dead, Tracing.CORRELATION_ID_HEADER)).isEqualTo("it-corr-4");
+         verify(simulator, times(4)).process(argThat(o -> "order-poison".equals(o.orderId())));
+         assertThat(inboxStatus(order)).isEqualTo(InboxStatus.FAILED);
+         // Rollback neúspěšných pokusů nesmí nechat v DB platbu.
+         assertThat(payments.findByOrderId("order-poison")).isEmpty();
+-        assertThat(counter(MessagingMetrics.DEAD_LETTERED, "topic", Topics.dltOf(Topics.ORDERS_CREATED))).isEqualTo(1.0);
++        assertThat(counter(MessagingMetrics.DEAD_LETTERED, "topic", Topics.dltOf(Topics.PAYMENTS_COMMANDS))).isEqualTo(1.0);
+         await().atMost(TIMEOUT).untilAsserted(() -> assertThat(consumerLag("payment-service")).isZero());
+         assertThat(KafkaTestSupport.collectRecords(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT,
+                 r -> "order-poison".equals(r.key()), Duration.ofSeconds(2))).isEmpty();
+     }
+ 
+-    private InboxStatus inboxStatus(OrderCreated order) {
++    @Test
++    @DisplayName("Zpráva v orders.created už platbu nespustí – platbu řídí jen příkaz z payments.commands")
++    void should_ignoreOrdersCreated_whenOrchestrated() {
++        KafkaTestSupport.sendRaw(kafka.getBootstrapServers(), "orders.created", "order-legacy",
++                "{\"eventId\":\"6f1c2d3e-0000-4000-8000-000000000001\",\"timestamp\":\"2026-10-08T10:00:00Z\","
++                        + "\"orderId\":\"order-legacy\",\"customerId\":\"c\",\"amount\":10,\"currency\":\"CZK\"}");
++
++        assertThat(KafkaTestSupport.collectRecords(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT,
++                r -> "order-legacy".equals(r.key()), Duration.ofSeconds(3))).isEmpty();
++    }
++
++    private InboxStatus inboxStatus(ProcessPayment order) {
+         return inbox.findById(order.eventId()).map(InboxEntry::status).orElseThrow();
+     }
+ 
+-    private void send(OrderCreated order) throws Exception {
+-        ProducerRecord<Object, Object> record = new ProducerRecord<>(Topics.ORDERS_CREATED, order.orderId(), order);
++    private void send(ProcessPayment order) throws Exception {
++        ProducerRecord<Object, Object> record = new ProducerRecord<>(Topics.PAYMENTS_COMMANDS, order.orderId(), order);
+         record.headers().add(Tracing.CORRELATION_ID_HEADER, order.correlationId().getBytes(StandardCharsets.UTF_8));
+         kafkaTemplate.send(record).get();
+     }
+ 
+     private double counter(String name, String tagKey, String tagValue) {
+         Counter counter = registry.find(name).tag(tagKey, tagValue).counter();
+         return counter == null ? 0 : counter.count();
+     }
+ 
+     /** Součet rozdílů mezi koncem partitions a commitnutým offsetem consumer group. */
+     private long consumerLag(String groupId) throws Exception {
+         try (Admin admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers()))) {
+             Map<TopicPartition, OffsetAndMetadata> committed =
+                     admin.listConsumerGroupOffsets(groupId).partitionsToOffsetAndMetadata().get();
+-            Map<TopicPartition, OffsetSpec> partitions = admin.describeTopics(List.of(Topics.ORDERS_CREATED))
+-                    .allTopicNames().get().get(Topics.ORDERS_CREATED).partitions().stream()
+-                    .map(p -> new TopicPartition(Topics.ORDERS_CREATED, p.partition()))
++            Map<TopicPartition, OffsetSpec> partitions = admin.describeTopics(List.of(Topics.PAYMENTS_COMMANDS))
++                    .allTopicNames().get().get(Topics.PAYMENTS_COMMANDS).partitions().stream()
++                    .map(p -> new TopicPartition(Topics.PAYMENTS_COMMANDS, p.partition()))
+                     .collect(Collectors.toMap(Function.identity(), tp -> OffsetSpec.latest()));
+             Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> ends = admin.listOffsets(partitions).all().get();
+             // Partition bez commitu vrací Admin API jako klíč s hodnotou null.
+             return ends.entrySet().stream()
+                     .mapToLong(e -> {
+                         OffsetAndMetadata offset = committed.get(e.getKey());
+                         return e.getValue().offset() - (offset == null ? 0 : offset.offset());
+                     })
+                     .sum();
+         }
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentServiceTest.java b/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentServiceTest.java
+index f6f34ef..15192db 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentServiceTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentServiceTest.java
+@@ -1,13 +1,13 @@
+ package cz.demo.eda.payment.domain;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.event.PaymentCompleted;
+ import cz.demo.eda.payment.event.PaymentFailed;
+ import cz.demo.eda.payment.outbox.OutboxPublisher;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
+@@ -38,56 +38,56 @@ class PaymentServiceTest {
+     private PaymentService service;
+ 
+     @BeforeEach
+     void setUp() {
+         service = new PaymentService(simulator, repository, outbox, Clock.fixed(NOW, ZoneOffset.UTC));
+     }
+ 
+     @Test
+     @DisplayName("Úspěšnou platbu uloží a výsledek zařadí do outboxu payments.result")
+     void should_saveAndPublish_whenPaymentCompleted() {
+-        OrderCreated order = order("10.00");
++        ProcessPayment order = order("10.00");
+         PaymentCompleted result = PaymentCompleted.of("c", "o-1", "p-1", order.amount());
+         when(simulator.process(order)).thenReturn(result);
+ 
+         assertThat(service.processPayment(order)).isEqualTo(result);
+ 
+         Payment saved = captureSaved();
+         assertThat(saved.status()).isEqualTo(PaymentStatus.COMPLETED);
+         assertThat(saved.createdAt()).isEqualTo(NOW);
+         verify(outbox).publish("payments.result", result);
+     }
+ 
+     @Test
+     @DisplayName("Zamítnutou platbu také uloží a publikuje PaymentFailed")
+     void should_saveAndPublish_whenPaymentDeclined() {
+-        OrderCreated order = order("10.00");
++        ProcessPayment order = order("10.00");
+         PaymentFailed result = PaymentFailed.of("c", "o-1", "declined");
+         when(simulator.process(order)).thenReturn(result);
+ 
+         service.processPayment(order);
+ 
+         assertThat(captureSaved().status()).isEqualTo(PaymentStatus.FAILED);
+         verify(outbox).publish("payments.result", result);
+     }
+ 
+     @Test
+     @DisplayName("Technická chyba simulace nic neuloží ani nepublikuje")
+     void should_propagate_whenSimulatorFails() {
+-        OrderCreated order = order("666");
++        ProcessPayment order = order("666");
+         when(simulator.process(order)).thenThrow(new PaymentProcessingException("boom"));
+ 
+         assertThatThrownBy(() -> service.processPayment(order)).isInstanceOf(PaymentProcessingException.class);
+ 
+         verifyNoInteractions(repository, outbox);
+     }
+ 
+     private Payment captureSaved() {
+         ArgumentCaptor<Payment> captor = ArgumentCaptor.forClass(Payment.class);
+         verify(repository).save(captor.capture());
+         return captor.getValue();
+     }
+ 
+-    private static OrderCreated order(String amount) {
+-        return OrderCreated.of("c", "o-1", "cust", new BigDecimal(amount), "CZK");
++    private static ProcessPayment order(String amount) {
++        return ProcessPayment.of("c", "o-1", new BigDecimal(amount), "CZK");
+     }
+ }
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentSimulatorTest.java b/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentSimulatorTest.java
+index 93edf49..f6e240f 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentSimulatorTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentSimulatorTest.java
+@@ -1,13 +1,13 @@
+ package cz.demo.eda.payment.domain;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.event.PaymentCompleted;
+ import cz.demo.eda.payment.event.PaymentFailed;
+ import cz.demo.eda.payment.event.PaymentResult;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.CsvSource;
+ 
+ import java.math.BigDecimal;
+ import java.util.random.RandomGenerator;
+@@ -16,21 +16,21 @@ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ 
+ class PaymentSimulatorTest {
+ 
+     private static final BigDecimal POISON = new BigDecimal("666");
+ 
+     @Test
+     @DisplayName("Při failure-rate 0 platba vždy projde a nese correlationId i částku")
+     void should_complete_whenFailureRateIsZero() {
+         PaymentSimulator simulator = simulator(0.0, 0.0);
+-        OrderCreated order = order("10.00");
++        ProcessPayment order = order("10.00");
+ 
+         PaymentResult result = simulator.process(order);
+ 
+         assertThat(result).isInstanceOfSatisfying(PaymentCompleted.class, completed -> {
+             assertThat(completed.orderId()).isEqualTo(order.orderId());
+             assertThat(completed.correlationId()).isEqualTo(order.correlationId());
+             assertThat(completed.amount()).isEqualByComparingTo("10.00");
+             assertThat(completed.paymentId()).isNotBlank();
+         });
+     }
+@@ -71,14 +71,14 @@ class PaymentSimulatorTest {
+             }
+ 
+             @Override
+             public double nextDouble() {
+                 return randomValue;
+             }
+         };
+         return new PaymentSimulator(new PaymentProperties(failureRate, POISON), fixedRandom);
+     }
+ 
+-    private static OrderCreated order(String amount) {
+-        return OrderCreated.of("corr-1", "o-1", "c-1", new BigDecimal(amount), "CZK");
++    private static ProcessPayment order(String amount) {
++        return ProcessPayment.of("corr-1", "o-1", new BigDecimal(amount), "CZK");
+     }
+ }
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentTest.java b/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentTest.java
+index aa7a580..e222f01 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/domain/PaymentTest.java
+@@ -1,28 +1,28 @@
+ package cz.demo.eda.payment.domain;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.event.PaymentCompleted;
+ import cz.demo.eda.payment.event.PaymentFailed;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ 
+ import java.math.BigDecimal;
+ import java.time.Instant;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatNullPointerException;
+ 
+ class PaymentTest {
+ 
+     private static final Instant NOW = Instant.parse("2026-01-01T10:00:00Z");
+-    private static final OrderCreated ORDER = OrderCreated.of("c", "o-1", "cust", new BigDecimal("12.00"), "EUR");
++    private static final ProcessPayment ORDER = ProcessPayment.of("c", "o-1", new BigDecimal("12.00"), "EUR");
+ 
+     @Test
+     @DisplayName("Úspěšná platba převezme paymentId z výsledku a částku z objednávky")
+     void should_buildCompletedPayment_whenResultCompleted() {
+         Payment payment = Payment.of(ORDER, PaymentCompleted.of("c", "o-1", "p-1", ORDER.amount()), NOW);
+ 
+         assertThat(payment.id()).isEqualTo("p-1");
+         assertThat(payment.status()).isEqualTo(PaymentStatus.COMPLETED);
+         assertThat(payment.amount()).isEqualByComparingTo("12.00");
+         assertThat(payment.currency()).isEqualTo("EUR");
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/event/EventSerializationTest.java b/payment-service/src/test/java/cz/demo/eda/payment/event/EventSerializationTest.java
+index e45482d..7b08a9e 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/event/EventSerializationTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/event/EventSerializationTest.java
+@@ -7,26 +7,26 @@ import tools.jackson.databind.json.JsonMapper;
+ import java.math.BigDecimal;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatNullPointerException;
+ 
+ class EventSerializationTest {
+ 
+     private final JsonMapper mapper = JsonMapper.builder().build();
+ 
+     @Test
+-    @DisplayName("OrderCreated projde JSON round-tripem beze ztráty dat")
+-    void should_roundTripOrderCreated_whenSerialized() {
+-        OrderCreated event = OrderCreated.of("corr-1", "order-1", "cust-1", new BigDecimal("12.50"), "CZK");
++    @DisplayName("ProcessPayment projde JSON round-tripem beze ztráty dat")
++    void should_roundTripProcessPayment_whenSerialized() {
++        ProcessPayment event = ProcessPayment.of("corr-1", "order-1", new BigDecimal("12.50"), "CZK");
+ 
+         String json = mapper.writeValueAsString(event);
+-        OrderCreated restored = mapper.readValue(json, OrderCreated.class);
++        ProcessPayment restored = mapper.readValue(json, ProcessPayment.class);
+ 
+         assertThat(restored).isEqualTo(event);
+         assertThat(json).contains("\"eventId\"", "\"timestamp\"", "\"correlationId\":\"corr-1\"");
+     }
+ 
+     @Test
+     @DisplayName("PaymentResult se deserializuje na správný podtyp podle pole type")
+     void should_deserializeSubtype_whenReadAsPaymentResult() {
+         PaymentResult completed = PaymentCompleted.of("c", "o-1", "p-1", BigDecimal.TEN);
+         PaymentResult failed = PaymentFailed.of("c", "o-2", "declined");
+@@ -36,21 +36,21 @@ class EventSerializationTest {
+ 
+         assertThat(completedJson).contains("\"type\":\"PaymentCompleted\"");
+         assertThat(mapper.readValue(completedJson, PaymentResult.class)).isEqualTo(completed);
+         assertThat(mapper.readValue(failedJson, PaymentResult.class)).isEqualTo(failed);
+     }
+ 
+     @Test
+     @DisplayName("Vyhodí výjimku když chybí orderId")
+     void should_throw_whenOrderIdIsNull() {
+         assertThatNullPointerException()
+-                .isThrownBy(() -> OrderCreated.of("c", null, "cust", BigDecimal.ONE, "CZK"));
++                .isThrownBy(() -> ProcessPayment.of("c", null, BigDecimal.ONE, "CZK"));
+     }
+ 
+     @Test
+     @DisplayName("Každá nová událost dostane unikátní eventId")
+     void should_generateUniqueEventIds_whenCreatedTwice() {
+         PaymentFailed first = PaymentFailed.of("c", "o", "r");
+         PaymentFailed second = PaymentFailed.of("c", "o", "r");
+ 
+         assertThat(first.eventId()).isNotEqualTo(second.eventId());
+     }
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/messaging/DeadLetterListenerTest.java b/payment-service/src/test/java/cz/demo/eda/payment/messaging/DeadLetterListenerTest.java
+index e3b47c5..374b196 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/messaging/DeadLetterListenerTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/messaging/DeadLetterListenerTest.java
+@@ -13,34 +13,34 @@ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.verify;
+ 
+ class DeadLetterListenerTest {
+ 
+     private final DeadLetterListener listener = new DeadLetterListener();
+ 
+     @Test
+     @DisplayName("Zprávu z DLT zaloguje a potvrdí")
+     void should_acknowledge_whenDeadLetterReceived() {
+-        ConsumerRecord<String, String> record = new ConsumerRecord<>("orders.created.DLT", 0, 0, "o-1", "{}");
++        ConsumerRecord<String, String> record = new ConsumerRecord<>("payments.commands.DLT", 0, 0, "o-1", "{}");
+         record.headers().add(KafkaHeaders.DLT_EXCEPTION_MESSAGE, "boom".getBytes(StandardCharsets.UTF_8));
+         record.headers().add(KafkaHeaders.DLT_ORIGINAL_OFFSET, ByteBuffer.allocate(Long.BYTES).putLong(7).array());
+         Acknowledgment ack = mock(Acknowledgment.class);
+ 
+         listener.onDeadLetter(record, ack);
+ 
+         verify(ack).acknowledge();
+     }
+ 
+     @Test
+     @DisplayName("Zprávu bez DLT hlaviček a s null hodnotou zpracuje bez chyby")
+     void should_acknowledge_whenHeadersAndValueMissing() {
+-        ConsumerRecord<String, String> record = new ConsumerRecord<>("orders.created.DLT", 0, 0, null, null);
++        ConsumerRecord<String, String> record = new ConsumerRecord<>("payments.commands.DLT", 0, 0, null, null);
+         Acknowledgment ack = mock(Acknowledgment.class);
+ 
+         listener.onDeadLetter(record, ack);
+ 
+         verify(ack).acknowledge();
+     }
+ 
+     @Test
+     @DisplayName("Vrátí text hlavičky, nebo null když chybí")
+     void should_readHeaderAsText_whenPresent() {
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/messaging/OrderCreatedHandlerTest.java b/payment-service/src/test/java/cz/demo/eda/payment/messaging/ProcessPaymentHandlerTest.java
+similarity index 74%
+rename from payment-service/src/test/java/cz/demo/eda/payment/messaging/OrderCreatedHandlerTest.java
+rename to payment-service/src/test/java/cz/demo/eda/payment/messaging/ProcessPaymentHandlerTest.java
+index 272f132..669eef7 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/messaging/OrderCreatedHandlerTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/messaging/ProcessPaymentHandlerTest.java
+@@ -1,51 +1,51 @@
+ package cz.demo.eda.payment.messaging;
+ 
+ import cz.demo.eda.payment.domain.PaymentService;
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.inbox.InboxEntry;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
+ import tools.jackson.core.JacksonException;
+ import tools.jackson.databind.json.JsonMapper;
+ 
+ import java.math.BigDecimal;
+ import java.time.Instant;
+ import java.util.UUID;
+ 
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.verifyNoInteractions;
+ 
+ @ExtendWith(MockitoExtension.class)
+-class OrderCreatedHandlerTest {
++class ProcessPaymentHandlerTest {
+ 
+     private final JsonMapper jsonMapper = JsonMapper.builder().build();
+ 
+     @Mock
+     private PaymentService paymentService;
+ 
+     @Test
+     @DisplayName("Payload z inboxu deserializuje a předá ke zpracování platby")
+     void should_processPayment_whenHandled() {
+-        OrderCreated event = OrderCreated.of("c", "o-1", "cust", new BigDecimal("9.99"), "CZK");
+-        OrderCreatedHandler handler = new OrderCreatedHandler(paymentService, jsonMapper);
++        ProcessPayment event = ProcessPayment.of("c", "o-1", new BigDecimal("9.99"), "CZK");
++        ProcessPaymentHandler handler = new ProcessPaymentHandler(paymentService, jsonMapper);
+ 
+-        handler.handle(InboxEntry.received(event.eventId(), "orders.created", "o-1",
++        handler.handle(InboxEntry.received(event.eventId(), "payments.commands", "o-1",
+                 jsonMapper.writeValueAsString(event), "c", Instant.now()));
+ 
+         verify(paymentService).processPayment(event);
+     }
+ 
+     @Test
+     @DisplayName("Nečitelný payload vyhodí výjimku – inbox ji zpracuje jako neúspěšný pokus")
+     void should_throw_whenPayloadInvalid() {
+-        OrderCreatedHandler handler = new OrderCreatedHandler(paymentService, jsonMapper);
++        ProcessPaymentHandler handler = new ProcessPaymentHandler(paymentService, jsonMapper);
+ 
+-        assertThatThrownBy(() -> handler.handle(InboxEntry.received(UUID.randomUUID(), "orders.created", "o-1",
++        assertThatThrownBy(() -> handler.handle(InboxEntry.received(UUID.randomUUID(), "payments.commands", "o-1",
+                 "not json", null, Instant.now()))).isInstanceOf(JacksonException.class);
+         verifyNoInteractions(paymentService);
+     }
+ }
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/messaging/OrderCreatedListenerTest.java b/payment-service/src/test/java/cz/demo/eda/payment/messaging/ProcessPaymentListenerTest.java
+similarity index 78%
+rename from payment-service/src/test/java/cz/demo/eda/payment/messaging/OrderCreatedListenerTest.java
+rename to payment-service/src/test/java/cz/demo/eda/payment/messaging/ProcessPaymentListenerTest.java
+index 9ae7e6c..98bd456 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/messaging/OrderCreatedListenerTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/messaging/ProcessPaymentListenerTest.java
+@@ -1,13 +1,13 @@
+ package cz.demo.eda.payment.messaging;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.inbox.InboxEntry;
+ import cz.demo.eda.payment.inbox.InboxService;
+ import cz.demo.eda.payment.inbox.InboxStatus;
+ import cz.demo.eda.payment.support.MessagingMetrics;
+ import cz.demo.eda.payment.support.Tracing;
+ import io.micrometer.core.instrument.Counter;
+ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+ import org.apache.kafka.clients.consumer.ConsumerRecord;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.DisplayName;
+@@ -26,100 +26,100 @@ import java.time.Instant;
+ import java.time.ZoneOffset;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+ @ExtendWith(MockitoExtension.class)
+-class OrderCreatedListenerTest {
++class ProcessPaymentListenerTest {
+ 
+     private static final Instant NOW = Instant.parse("2026-01-01T10:00:00Z");
+ 
+     @Mock
+     private InboxService inbox;
+     @Mock
+     private Acknowledgment ack;
+ 
+     private SimpleMeterRegistry registry;
+-    private OrderCreatedListener listener;
++    private ProcessPaymentListener listener;
+ 
+     @BeforeEach
+     void setUp() {
+         registry = new SimpleMeterRegistry();
+-        listener = new OrderCreatedListener(inbox, JsonMapper.builder().build(), new MessagingMetrics(registry),
++        listener = new ProcessPaymentListener(inbox, JsonMapper.builder().build(), new MessagingMetrics(registry),
+                 Clock.fixed(NOW, ZoneOffset.UTC));
+     }
+ 
+     @Test
+     @DisplayName("Objednávku uloží do inboxu s correlationId z hlavičky a potvrdí offset")
+     void should_storeAndAck_whenFirstDelivery() {
+-        OrderCreated event = order();
+-        ConsumerRecord<String, OrderCreated> record = record(event);
++        ProcessPayment event = order();
++        ConsumerRecord<String, ProcessPayment> record = record(event);
+         record.headers().add(Tracing.CORRELATION_ID_HEADER, "corr-h".getBytes(StandardCharsets.UTF_8));
+         when(inbox.store(any())).thenReturn(true);
+ 
+-        listener.onOrderCreated(record, ack);
++        listener.onProcessPayment(record, ack);
+ 
+         InboxEntry stored = captureStored();
+         assertThat(stored.eventId()).isEqualTo(event.eventId());
+-        assertThat(stored.topic()).isEqualTo("orders.created");
++        assertThat(stored.topic()).isEqualTo("payments.commands");
+         assertThat(stored.messageKey()).isEqualTo("o-1");
+         assertThat(stored.payload()).contains("\"orderId\":\"o-1\"");
+         assertThat(stored.correlationId()).isEqualTo("corr-h");
+         assertThat(stored.status()).isEqualTo(InboxStatus.PENDING);
+         verify(ack).acknowledge();
+         assertThat(consumed(MessagingMetrics.OUTCOME_STORED)).isEqualTo(1.0);
+     }
+ 
+     @Test
+-    @DisplayName("Duplicitní OrderCreated jen potvrdí a započítá jako duplicate")
++    @DisplayName("Duplicitní ProcessPayment jen potvrdí a započítá jako duplicate")
+     void should_ackAndCountDuplicate_whenAlreadyInInbox() {
+         when(inbox.store(any())).thenReturn(false);
+ 
+-        listener.onOrderCreated(record(order()), ack);
++        listener.onProcessPayment(record(order()), ack);
+ 
+         verify(ack).acknowledge();
+         assertThat(consumed(MessagingMetrics.OUTCOME_DUPLICATE)).isEqualTo(1.0);
+     }
+ 
+     @Test
+     @DisplayName("Bez hlavičky použije correlationId z těla události")
+     void should_useBodyCorrelationId_whenHeaderMissing() {
+         when(inbox.store(any())).thenReturn(true);
+ 
+-        listener.onOrderCreated(record(order()), ack);
++        listener.onProcessPayment(record(order()), ack);
+ 
+         assertThat(captureStored().correlationId()).isEqualTo("corr-body");
+     }
+ 
+     @Test
+     @DisplayName("Při chybě ukládání offset nepotvrdí – rozhodne Kafka error handler")
+     void should_notAck_whenInboxStoreFails() {
+         when(inbox.store(any())).thenThrow(new IllegalStateException("db down"));
+ 
+-        assertThatIllegalStateException().isThrownBy(() -> listener.onOrderCreated(record(order()), ack));
++        assertThatIllegalStateException().isThrownBy(() -> listener.onProcessPayment(record(order()), ack));
+ 
+         verify(ack, never()).acknowledge();
+     }
+ 
+     private InboxEntry captureStored() {
+         ArgumentCaptor<InboxEntry> captor = ArgumentCaptor.forClass(InboxEntry.class);
+         verify(inbox).store(captor.capture());
+         return captor.getValue();
+     }
+ 
+     private double consumed(String outcome) {
+         Counter counter = registry.find(MessagingMetrics.CONSUMED).tag("outcome", outcome).counter();
+         return counter == null ? 0 : counter.count();
+     }
+ 
+-    private static OrderCreated order() {
+-        return OrderCreated.of("corr-body", "o-1", "cust", BigDecimal.TEN, "CZK");
++    private static ProcessPayment order() {
++        return ProcessPayment.of("corr-body", "o-1", BigDecimal.TEN, "CZK");
+     }
+ 
+-    private static ConsumerRecord<String, OrderCreated> record(OrderCreated event) {
+-        return new ConsumerRecord<>("orders.created", 0, 0, event.orderId(), event);
++    private static ConsumerRecord<String, ProcessPayment> record(ProcessPayment event) {
++        return new ConsumerRecord<>("payments.commands", 0, 0, event.orderId(), event);
+     }
+ }
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/outbox/OutboxPublisherTest.java b/payment-service/src/test/java/cz/demo/eda/payment/outbox/OutboxPublisherTest.java
+index b021ddb..7cd6634 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/outbox/OutboxPublisherTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/outbox/OutboxPublisherTest.java
+@@ -1,13 +1,13 @@
+ package cz.demo.eda.payment.outbox;
+ 
+-import cz.demo.eda.payment.event.OrderCreated;
++import cz.demo.eda.payment.event.ProcessPayment;
+ import cz.demo.eda.payment.inbox.InboxEntry;
+ import cz.demo.eda.payment.support.Tracing;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
+ import tools.jackson.databind.json.JsonMapper;
+@@ -33,57 +33,57 @@ class OutboxPublisherTest {
+     private OutboxPublisher publisher;
+ 
+     @BeforeEach
+     void setUp() {
+         publisher = new OutboxPublisher(repository, JsonMapper.builder().build(), Clock.fixed(NOW, ZoneOffset.UTC));
+     }
+ 
+     @Test
+     @DisplayName("Událost uloží s klíčem orderId, JSON payloadem a hlavičkou correlationId")
+     void should_storeEventAsJson_whenPublished() {
+-        OrderCreated event = OrderCreated.of("corr-1", "o-1", "c-1", new BigDecimal("10.50"), "CZK");
++        ProcessPayment event = ProcessPayment.of("corr-1", "o-1", new BigDecimal("10.50"), "CZK");
+ 
+-        publisher.publish("orders.created", event);
++        publisher.publish("payments.commands", event);
+ 
+         OutboxEntry saved = captureSaved();
+         assertThat(saved.eventId()).isEqualTo(event.eventId());
+-        assertThat(saved.topic()).isEqualTo("orders.created");
++        assertThat(saved.topic()).isEqualTo("payments.commands");
+         assertThat(saved.messageKey()).isEqualTo("o-1");
+         assertThat(saved.payload()).contains("\"orderId\":\"o-1\"", "\"amount\":10.50", "\"eventId\"");
+         assertThat(saved.headers()).containsExactlyEntriesOf(Map.of(Tracing.CORRELATION_ID_HEADER, "corr-1"));
+         assertThat(saved.createdAt()).isEqualTo(NOW);
+     }
+ 
+     @Test
+     @DisplayName("Bez correlationId uloží prázdné hlavičky")
+     void should_storeNoHeaders_whenCorrelationIdIsNull() {
+-        publisher.publish("orders.created", OrderCreated.of(null, "o-1", "c-1", BigDecimal.ONE, "CZK"));
++        publisher.publish("payments.commands", ProcessPayment.of(null, "o-1", BigDecimal.ONE, "CZK"));
+ 
+         assertThat(captureSaved().headers()).isEmpty();
+     }
+ 
+     @Test
+     @DisplayName("DLT zprávu pošle do <topic>.DLT s původním payloadem, počtem pokusů a důvodem selhání")
+     void should_storeDeadLetterWithErrorHeaders_whenProcessingGaveUp() {
+-        InboxEntry entry = InboxEntry.received(UUID.randomUUID(), "orders.created", "o-1", "{\"x\":1}", "corr-9", NOW);
++        InboxEntry entry = InboxEntry.received(UUID.randomUUID(), "payments.commands", "o-1", "{\"x\":1}", "corr-9", NOW);
+         entry.markFailed("boom", NOW);
+ 
+         publisher.publishDeadLetter(entry, new IllegalStateException("x".repeat(1500)));
+ 
+         OutboxEntry saved = captureSaved();
+-        assertThat(saved.topic()).isEqualTo("orders.created.DLT");
++        assertThat(saved.topic()).isEqualTo("payments.commands.DLT");
+         assertThat(saved.eventId()).isEqualTo(entry.eventId());
+         assertThat(saved.messageKey()).isEqualTo("o-1");
+         assertThat(saved.payload()).isEqualTo("{\"x\":1}");
+         assertThat(saved.headers())
+                 .containsEntry(Tracing.CORRELATION_ID_HEADER, "corr-9")
+-                .containsEntry(OutboxPublisher.DLT_ORIGINAL_TOPIC, "orders.created")
++                .containsEntry(OutboxPublisher.DLT_ORIGINAL_TOPIC, "payments.commands")
+                 .containsEntry(OutboxPublisher.DLT_EXCEPTION_FQCN, IllegalStateException.class.getName())
+                 .containsEntry(OutboxPublisher.DLT_ATTEMPTS, "1");
+         assertThat(saved.headers().get(OutboxPublisher.DLT_EXCEPTION_MESSAGE)).hasSize(1000);
+     }
+ 
+     private OutboxEntry captureSaved() {
+         ArgumentCaptor<OutboxEntry> captor = ArgumentCaptor.forClass(OutboxEntry.class);
+         verify(repository).save(captor.capture());
+         return captor.getValue();
+     }
+diff --git a/payment-service/src/test/java/cz/demo/eda/payment/support/TopicsTest.java b/payment-service/src/test/java/cz/demo/eda/payment/support/TopicsTest.java
+index 6502feb..477fa00 100644
+--- a/payment-service/src/test/java/cz/demo/eda/payment/support/TopicsTest.java
++++ b/payment-service/src/test/java/cz/demo/eda/payment/support/TopicsTest.java
+@@ -3,19 +3,19 @@ package cz.demo.eda.payment.support;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
+ class TopicsTest {
+ 
+     @Test
+     @DisplayName("Vrátí název DLT topicu s příponou .DLT")
+     void should_appendDltSuffix_whenTopicGiven() {
+-        assertThat(Topics.dltOf(Topics.ORDERS_CREATED)).isEqualTo("orders.created.DLT");
++        assertThat(Topics.dltOf(Topics.PAYMENTS_COMMANDS)).isEqualTo("payments.commands.DLT");
+     }
+ 
+     @Test
+     @DisplayName("Pro prázdný název vrátí jen příponu")
+     void should_returnSuffixOnly_whenTopicIsEmpty() {
+         assertThat(Topics.dltOf("")).isEqualTo(".DLT");
+     }
+ }

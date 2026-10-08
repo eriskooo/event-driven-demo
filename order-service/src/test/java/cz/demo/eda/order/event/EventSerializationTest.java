@@ -26,17 +26,18 @@ class EventSerializationTest {
     }
 
     @Test
-    @DisplayName("PaymentResult se deserializuje na správný podtyp podle pole type")
-    void should_deserializeSubtype_whenReadAsPaymentResult() {
-        PaymentResult completed = PaymentCompleted.of("c", "o-1", "p-1", BigDecimal.TEN);
-        PaymentResult failed = PaymentFailed.of("c", "o-2", "declined");
+    @DisplayName("OrderCommand se deserializuje na správný podtyp podle pole type")
+    void should_deserializeSubtype_whenReadAsOrderCommand() {
+        OrderCommand confirm = ConfirmOrder.of("c", "o-1", "p-1");
+        OrderCommand cancel = CancelOrder.of("c", "o-2", "declined");
 
-        String completedJson = mapper.writeValueAsString(completed);
-        String failedJson = mapper.writeValueAsString(failed);
+        String confirmJson = mapper.writeValueAsString(confirm);
+        String cancelJson = mapper.writeValueAsString(cancel);
 
-        assertThat(completedJson).contains("\"type\":\"PaymentCompleted\"");
-        assertThat(mapper.readValue(completedJson, PaymentResult.class)).isEqualTo(completed);
-        assertThat(mapper.readValue(failedJson, PaymentResult.class)).isEqualTo(failed);
+        assertThat(confirmJson).contains("\"type\":\"ConfirmOrder\"", "\"paymentId\":\"p-1\"");
+        assertThat(cancelJson).contains("\"type\":\"CancelOrder\"", "\"reason\":\"declined\"");
+        assertThat(mapper.readValue(confirmJson, OrderCommand.class)).isEqualTo(confirm);
+        assertThat(mapper.readValue(cancelJson, OrderCommand.class)).isEqualTo(cancel);
     }
 
     @Test
@@ -47,11 +48,17 @@ class EventSerializationTest {
     }
 
     @Test
-    @DisplayName("Každá nová událost dostane unikátní eventId")
+    @DisplayName("Každý nový příkaz dostane unikátní eventId")
     void should_generateUniqueEventIds_whenCreatedTwice() {
-        PaymentFailed first = PaymentFailed.of("c", "o", "r");
-        PaymentFailed second = PaymentFailed.of("c", "o", "r");
+        CancelOrder first = CancelOrder.of("c", "o", "r");
+        CancelOrder second = CancelOrder.of("c", "o", "r");
 
         assertThat(first.eventId()).isNotEqualTo(second.eventId());
+    }
+
+    @Test
+    @DisplayName("Vyhodí výjimku když ConfirmOrder nemá orderId")
+    void should_throw_whenCommandOrderIdIsNull() {
+        assertThatNullPointerException().isThrownBy(() -> ConfirmOrder.of("c", null, "p-1"));
     }
 }

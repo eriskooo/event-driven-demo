@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:modeler="http://camunda.org/schema/modeler/1.0"
+                  id="Definitions_order_fulfillment"
+                  targetNamespace="http://bpmn.io/schema/bpmn"
+                  modeler:executionPlatform="Camunda Cloud"
+                  modeler:executionPlatformVersion="8.10.0">
+  <bpmn:process id="order-fulfillment" name="Order fulfillment" isExecutable="true">
+    <bpmn:startEvent id="order_created" name="Order created">
+      <bpmn:outgoing>flow_to_request_payment</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="order_created_definition" messageRef="message_order_created" />
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="request_payment" name="Request payment">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="request-payment" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>flow_to_request_payment</bpmn:incoming>
+      <bpmn:outgoing>flow_to_payment_result</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:intermediateCatchEvent id="payment_result" name="Payment result">
+      <bpmn:incoming>flow_to_payment_result</bpmn:incoming>
+      <bpmn:outgoing>flow_to_gateway</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="payment_result_definition" messageRef="message_payment_result" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:exclusiveGateway id="payment_completed_gateway" name="Payment completed?" default="flow_failed">
+      <bpmn:incoming>flow_to_gateway</bpmn:incoming>
+      <bpmn:outgoing>flow_completed</bpmn:outgoing>
+      <bpmn:outgoing>flow_failed</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="confirm_order" name="Confirm order">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="confirm-order" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>flow_completed</bpmn:incoming>
+      <bpmn:outgoing>flow_to_confirmed</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="cancel_order" name="Cancel order">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="cancel-order" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>flow_failed</bpmn:incoming>
+      <bpmn:outgoing>flow_to_cancelled</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="order_confirmed" name="Order confirmed">
+      <bpmn:incoming>flow_to_confirmed</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="order_cancelled" name="Order cancelled">
+      <bpmn:incoming>flow_to_cancelled</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="flow_to_request_payment" sourceRef="order_created" targetRef="request_payment" />
+    <bpmn:sequenceFlow id="flow_to_payment_result" sourceRef="request_payment" targetRef="payment_result" />
+    <bpmn:sequenceFlow id="flow_to_gateway" sourceRef="payment_result" targetRef="payment_completed_gateway" />
+    <bpmn:sequenceFlow id="flow_completed" name="yes" sourceRef="payment_completed_gateway" targetRef="confirm_order">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=paymentStatus = "COMPLETED"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="flow_failed" name="no" sourceRef="payment_completed_gateway" targetRef="cancel_order" />
+    <bpmn:sequenceFlow id="flow_to_confirmed" sourceRef="confirm_order" targetRef="order_confirmed" />
+    <bpmn:sequenceFlow id="flow_to_cancelled" sourceRef="cancel_order" targetRef="order_cancelled" />
+  </bpmn:process>
+  <bpmn:message id="message_order_created" name="OrderCreated" />
+  <bpmn:message id="message_payment_result" name="PaymentResult">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=orderId" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmndi:BPMNDiagram id="diagram_order_fulfillment">
+    <bpmndi:BPMNPlane id="plane_order_fulfillment" bpmnElement="order-fulfillment">
+      <bpmndi:BPMNShape id="order_created_di" bpmnElement="order_created">
+        <dc:Bounds x="152" y="102" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="136" y="145" width="68" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="request_payment_di" bpmnElement="request_payment">
+        <dc:Bounds x="240" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="payment_result_di" bpmnElement="payment_result">
+        <dc:Bounds x="392" y="102" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="373" y="145" width="74" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="payment_completed_gateway_di" bpmnElement="payment_completed_gateway" isMarkerVisible="true">
+        <dc:Bounds x="485" y="95" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="460" y="65" width="100" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="confirm_order_di" bpmnElement="confirm_order">
+        <dc:Bounds x="600" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="cancel_order_di" bpmnElement="cancel_order">
+        <dc:Bounds x="600" y="200" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="order_confirmed_di" bpmnElement="order_confirmed">
+        <dc:Bounds x="762" y="102" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="740" y="145" width="80" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="order_cancelled_di" bpmnElement="order_cancelled">
+        <dc:Bounds x="762" y="222" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="740" y="265" width="80" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="flow_to_request_payment_di" bpmnElement="flow_to_request_payment">
+        <di:waypoint x="188" y="120" /><di:waypoint x="240" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="flow_to_payment_result_di" bpmnElement="flow_to_payment_result">
+        <di:waypoint x="340" y="120" /><di:waypoint x="392" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="flow_to_gateway_di" bpmnElement="flow_to_gateway">
+        <di:waypoint x="428" y="120" /><di:waypoint x="485" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="flow_completed_di" bpmnElement="flow_completed">
+        <di:waypoint x="535" y="120" /><di:waypoint x="600" y="120" />
+        <bpmndi:BPMNLabel><dc:Bounds x="559" y="102" width="18" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="flow_failed_di" bpmnElement="flow_failed">
+        <di:waypoint x="510" y="145" /><di:waypoint x="510" y="240" /><di:waypoint x="600" y="240" />
+        <bpmndi:BPMNLabel><dc:Bounds x="518" y="190" width="14" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="flow_to_confirmed_di" bpmnElement="flow_to_confirmed">
+        <di:waypoint x="700" y="120" /><di:waypoint x="762" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="flow_to_cancelled_di" bpmnElement="flow_to_cancelled">
+        <di:waypoint x="700" y="240" /><di:waypoint x="762" y="240" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

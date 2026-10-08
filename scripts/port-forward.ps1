@@ -3,6 +3,8 @@ $ns = 'eda-demo'
 $forwards = @(
     @('order-service', '8080:8080', 'http://localhost:8080/orders'),
     @('payment-service', '8081:8080', 'http://localhost:8081/actuator/health'),
+    @('order-process', '8082:8080', 'http://localhost:8082/actuator/health'),
+    @('camunda', '8088:8080', 'http://localhost:8088/operate (demo/demo)'),
     @('postgres', '5432:5432', 'jdbc:postgresql://localhost:5432/eda'),
     @('grafana', '3000:3000', 'http://localhost:3000 (admin/admin)'),
     @('prometheus', '9090:9090', 'http://localhost:9090'),

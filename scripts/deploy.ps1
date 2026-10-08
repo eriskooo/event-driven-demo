@@ -1,5 +1,5 @@
 # Nasadí stack do namespace eda-demo a počká na rollout.
-# Použití: .\deploy.ps1 [-Stack base|monitoring|logging|full]   (výchozí base = Kafka, PostgreSQL, obě služby)
+# Použití: .\deploy.ps1 [-Stack base|monitoring|logging|full]   (výchozí base = Kafka, PostgreSQL, Camunda, služby)
 # ($Profile nelze – je to vestavěná proměnná PowerShellu.)
 param(
     [ValidateSet('base', 'monitoring', 'logging', 'full')]
@@ -20,8 +20,8 @@ Write-Host ">> Deploying profile '$Stack' ($target)"
 Invoke-Checked { kubectl apply -k $target } 'kubectl apply'
 
 # Infrastruktura první – služby na ni čekají v initContaineru.
-foreach ($workload in 'statefulset/postgres', 'deployment/kafka') {
-    Invoke-Checked { kubectl -n $ns rollout status $workload --timeout=300s } "rollout of $workload"
+foreach ($workload in 'statefulset/postgres', 'deployment/kafka', 'statefulset/camunda') {
+    Invoke-Checked { kubectl -n $ns rollout status $workload --timeout=600s } "rollout of $workload"
 }
 foreach ($workload in (kubectl -n $ns get deployment,daemonset -o name)) {
     Write-Host ">> Waiting for $workload"

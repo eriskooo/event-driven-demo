@@ -1,0 +1,978 @@
+# Review package: snapshot t2 -> t3 (uncommitted working tree; user commits manually)
+
+## Files changed
+ .../snap-t3/order-process/.dockerignore            |  3 +
+ .../snap-t3/order-process/Dockerfile               | 27 ++++++
+ .../snap-t3/order-process/pom.xml                  | 95 ++++++++++++++++++++++
+ .../demo/eda/process/OrderProcessApplication.java  | 18 ++++
+ .../java/cz/demo/eda/process/config/AppConfig.java | 17 ++++
+ .../eda/process/config/EdaKafkaProperties.java     | 28 +++++++
+ .../cz/demo/eda/process/config/KafkaConfig.java    | 91 +++++++++++++++++++++
+ .../demo/eda/process/config/ProcessProperties.java | 22 +++++
+ .../cz/demo/eda/process/event/CancelOrder.java     | 20 +++++
+ .../cz/demo/eda/process/event/ConfirmOrder.java    | 20 +++++
+ .../cz/demo/eda/process/event/DomainEvent.java     | 17 ++++
+ .../cz/demo/eda/process/event/OrderCommand.java    | 15 ++++
+ .../cz/demo/eda/process/event/OrderCreated.java    | 22 +++++
+ .../demo/eda/process/event/PaymentCompleted.java   | 21 +++++
+ .../cz/demo/eda/process/event/PaymentFailed.java   | 19 +++++
+ .../cz/demo/eda/process/event/PaymentResult.java   | 13 +++
+ .../cz/demo/eda/process/event/ProcessPayment.java  | 23 ++++++
+ .../support/CorrelationIdRecordInterceptor.java    | 29 +++++++
+ .../java/cz/demo/eda/process/support/Topics.java   | 20 +++++
+ .../java/cz/demo/eda/process/support/Tracing.java  | 11 +++
+ .../src/main/resources/application.yml             | 78 ++++++++++++++++++
+ .../eda/process/config/ProcessPropertiesTest.java  | 30 +++++++
+ .../eda/process/event/EventSerializationTest.java  | 73 +++++++++++++++++
+ .../CorrelationIdRecordInterceptorTest.java        | 45 ++++++++++
+ .../cz/demo/eda/process/support/TopicsTest.java    | 21 +++++
+ .../{snap-t2 => snap-t3}/pom.xml                   |  1 +
+ 26 files changed, 779 insertions(+)
+
+## Diff
+diff --git a/order-process/.dockerignore b/order-process/.dockerignore
+new file mode 100644
+index 0000000..1ebf457
+--- /dev/null
++++ b/order-process/.dockerignore
+@@ -0,0 +1,3 @@
++target/
++*.iml
++.idea/
+diff --git a/order-process/Dockerfile b/order-process/Dockerfile
+new file mode 100644
+index 0000000..dbe397d
+--- /dev/null
++++ b/order-process/Dockerfile
+@@ -0,0 +1,27 @@
++# syntax=docker/dockerfile:1
++
++# --- build: Maven cache v BuildKit mountu zrychlí opakované buildy ---
++FROM maven:3.9-eclipse-temurin-21-noble AS build
++WORKDIR /workspace
++COPY pom.xml .
++COPY src src
++RUN --mount=type=cache,target=/root/.m2 mvn -B -q package -DskipTests
++
++# --- extract: rozbalení do vrstev, aby se při změně kódu nepřenášely závislosti ---
++FROM eclipse-temurin:21-jre-noble AS extract
++WORKDIR /extract
++COPY --from=build /workspace/target/app.jar app.jar
++RUN java -Djarmode=tools -jar app.jar extract --layers --launcher --destination layers
++
++# --- runtime ---
++FROM eclipse-temurin:21-jre-noble
++WORKDIR /app
++RUN useradd --system --uid 10001 --no-create-home spring
++COPY --from=extract /extract/layers/dependencies/ ./
++COPY --from=extract /extract/layers/spring-boot-loader/ ./
++COPY --from=extract /extract/layers/snapshot-dependencies/ ./
++COPY --from=extract /extract/layers/application/ ./
++USER 10001
++EXPOSE 8080
++ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
++ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]
+diff --git a/order-process/pom.xml b/order-process/pom.xml
+new file mode 100644
+index 0000000..ad4bd7f
+--- /dev/null
++++ b/order-process/pom.xml
+@@ -0,0 +1,95 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <modelVersion>4.0.0</modelVersion>
++
++    <parent>
++        <groupId>org.springframework.boot</groupId>
++        <artifactId>spring-boot-starter-parent</artifactId>
++        <version>4.1.1</version>
++        <relativePath/>
++    </parent>
++
++    <groupId>cz.demo.eda</groupId>
++    <artifactId>order-process</artifactId>
++    <version>0.0.1-SNAPSHOT</version>
++    <name>order-process</name>
++    <description>Orchestrátor objednávky: BPMN proces v Camundě řízený přes Kafku</description>
++
++    <properties>
++        <java.version>21</java.version>
++        <camunda.version>8.10.2</camunda.version>
++    </properties>
++
++    <dependencies>
++        <dependency>
++            <groupId>io.camunda</groupId>
++            <artifactId>camunda-spring-boot-starter</artifactId>
++            <version>${camunda.version}</version>
++        </dependency>
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-webmvc</artifactId>
++        </dependency>
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-kafka</artifactId>
++        </dependency>
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-actuator</artifactId>
++        </dependency>
++        <dependency>
++            <groupId>io.micrometer</groupId>
++            <artifactId>micrometer-registry-prometheus</artifactId>
++        </dependency>
++
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-test</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-kafka-test</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-testcontainers</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>org.testcontainers</groupId>
++            <artifactId>testcontainers-kafka</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>org.testcontainers</groupId>
++            <artifactId>testcontainers-junit-jupiter</artifactId>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.camunda</groupId>
++            <artifactId>camunda-process-test-spring</artifactId>
++            <version>${camunda.version}</version>
++            <scope>test</scope>
++        </dependency>
++        <dependency>
++            <groupId>org.awaitility</groupId>
++            <artifactId>awaitility</artifactId>
++            <scope>test</scope>
++        </dependency>
++    </dependencies>
++
++    <build>
++        <finalName>app</finalName>
++        <plugins>
++            <plugin>
++                <groupId>org.springframework.boot</groupId>
++                <artifactId>spring-boot-maven-plugin</artifactId>
++            </plugin>
++        </plugins>
++    </build>
++</project>
+diff --git a/order-process/src/main/java/cz/demo/eda/process/OrderProcessApplication.java b/order-process/src/main/java/cz/demo/eda/process/OrderProcessApplication.java
+new file mode 100644
+index 0000000..0db64fa
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/OrderProcessApplication.java
+@@ -0,0 +1,18 @@
++package cz.demo.eda.process;
++
++import io.camunda.client.annotation.Deployment;
++import org.springframework.boot.SpringApplication;
++import org.springframework.boot.autoconfigure.SpringBootApplication;
++import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
++
++/** Vstupní bod order-process; při startu nasadí BPMN modely z classpath do Zeebe. */
++@SpringBootApplication
++@ConfigurationPropertiesScan
++@Deployment(resources = "classpath*:bpmn/*.bpmn")
++public class OrderProcessApplication {
++
++    /** Spustí aplikaci. */
++    public static void main(String[] args) {
++        SpringApplication.run(OrderProcessApplication.class, args);
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/config/AppConfig.java b/order-process/src/main/java/cz/demo/eda/process/config/AppConfig.java
+new file mode 100644
+index 0000000..e27810b
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/config/AppConfig.java
+@@ -0,0 +1,17 @@
++package cz.demo.eda.process.config;
++
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++
++import java.time.Clock;
++
++/** Obecné beany aplikace. */
++@Configuration(proxyBeanMethods = false)
++public class AppConfig {
++
++    /** Systémové hodiny v UTC; jako bean kvůli deterministickým testům. */
++    @Bean
++    Clock clock() {
++        return Clock.systemUTC();
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/config/EdaKafkaProperties.java b/order-process/src/main/java/cz/demo/eda/process/config/EdaKafkaProperties.java
+new file mode 100644
+index 0000000..c29e2d8
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/config/EdaKafkaProperties.java
+@@ -0,0 +1,28 @@
++package cz.demo.eda.process.config;
++
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.boot.context.properties.bind.DefaultValue;
++
++import java.time.Duration;
++
++/**
++ * Nastavení topiců a retry politiky konzumenta.
++ *
++ * @param topics počet partitions a replik vytvářených topiců
++ * @param retry  exponenciální backoff před přesunem zprávy do DLT
++ */
++@ConfigurationProperties("eda.kafka")
++public record EdaKafkaProperties(@DefaultValue Topics topics, @DefaultValue Retry retry) {
++
++    /** Parametry vytvářených topiců. */
++    public record Topics(@DefaultValue("3") int partitions, @DefaultValue("1") short replicas) {
++    }
++
++    /** Parametry exponenciálního backoffu. */
++    public record Retry(
++            @DefaultValue("3") int maxRetries,
++            @DefaultValue("500ms") Duration initialInterval,
++            @DefaultValue("2.0") double multiplier,
++            @DefaultValue("5s") Duration maxInterval) {
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/config/KafkaConfig.java b/order-process/src/main/java/cz/demo/eda/process/config/KafkaConfig.java
+new file mode 100644
+index 0000000..643f182
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/config/KafkaConfig.java
+@@ -0,0 +1,91 @@
++package cz.demo.eda.process.config;
++
++import cz.demo.eda.process.support.Topics;
++import org.apache.kafka.clients.admin.NewTopic;
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.apache.kafka.clients.producer.ProducerConfig;
++import org.apache.kafka.common.TopicPartition;
++import org.apache.kafka.common.serialization.ByteArraySerializer;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.kafka.config.TopicBuilder;
++import org.springframework.kafka.core.KafkaAdmin;
++import org.springframework.kafka.core.KafkaOperations;
++import org.springframework.kafka.core.KafkaTemplate;
++import org.springframework.kafka.core.ProducerFactory;
++import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
++import org.springframework.kafka.listener.DefaultErrorHandler;
++import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/** Topicy, retry s backoffem a dead letter topicy pro konzumenty orders.created a payments.result. */
++@Configuration(proxyBeanMethods = false)
++public class KafkaConfig {
++
++    private static final Logger log = LoggerFactory.getLogger(KafkaConfig.class);
++
++    /**
++     * Topicy, které služba produkuje nebo konzumuje, plus DLT svého konzumenta.
++     * KafkaAdmin je vytvoří při startu; existující topicy nechá být.
++     */
++    @Bean
++    KafkaAdmin.NewTopics edaTopics(EdaKafkaProperties properties) {
++        EdaKafkaProperties.Topics settings = properties.topics();
++        return new KafkaAdmin.NewTopics(
++                topic(Topics.ORDERS_CREATED, settings),
++                topic(Topics.PAYMENTS_COMMANDS, settings),
++                topic(Topics.PAYMENTS_RESULT, settings),
++                topic(Topics.ORDERS_COMMANDS, settings),
++                // DLT má stejný počet partitions, aby recoverer mohl zachovat číslo partition.
++                topic(Topics.dltOf(Topics.ORDERS_CREATED), settings),
++                topic(Topics.dltOf(Topics.PAYMENTS_RESULT), settings));
++    }
++
++    /** Error handler: retry s exponenciálním backoffem, poté publikace do &lt;topic&gt;.DLT. */
++    @Bean
++    DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<Object, Object> kafkaTemplate,
++                                          ProducerFactory<Object, Object> producerFactory,
++                                          EdaKafkaProperties properties) {
++        DeadLetterPublishingRecoverer recoverer = deadLetterRecoverer(kafkaTemplate, producerFactory);
++        DefaultErrorHandler handler = new DefaultErrorHandler((record, ex) -> {
++            recoverer.accept(record, ex);
++            log.error("Record {}-{}@{} moved to {} after retries", record.topic(), record.partition(),
++                    record.offset(), Topics.dltOf(record.topic()), ex);
++        }, backOff(properties.retry()));
++        handler.setRetryListeners((record, ex, attempt) -> log.warn("Delivery attempt {} of record {}-{}@{} failed: {}",
++                attempt, record.topic(), record.partition(), record.offset(), ex.getMessage()));
++        return handler;
++    }
++
++    private static DeadLetterPublishingRecoverer deadLetterRecoverer(KafkaTemplate<Object, Object> jsonTemplate,
++                                                                     ProducerFactory<Object, Object> producerFactory) {
++        // Nedeserializovatelná zpráva má jako hodnotu původní byte[] – ten musí jít do DLT beze změny,
++        // JSON serializer by ho zakódoval do base64.
++        KafkaTemplate<Object, Object> bytesTemplate = new KafkaTemplate<>(producerFactory,
++                Map.of(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class));
++        Map<Class<?>, KafkaOperations<?, ?>> templates = new LinkedHashMap<>();
++        templates.put(byte[].class, bytesTemplate);
++        templates.put(Object.class, jsonTemplate);
++        return new DeadLetterPublishingRecoverer(templates, KafkaConfig::dltPartition);
++    }
++
++    private static TopicPartition dltPartition(ConsumerRecord<?, ?> record, Exception ex) {
++        return new TopicPartition(Topics.dltOf(record.topic()), record.partition());
++    }
++
++    private static ExponentialBackOffWithMaxRetries backOff(EdaKafkaProperties.Retry retry) {
++        ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(retry.maxRetries());
++        backOff.setInitialInterval(retry.initialInterval().toMillis());
++        backOff.setMultiplier(retry.multiplier());
++        backOff.setMaxInterval(retry.maxInterval().toMillis());
++        return backOff;
++    }
++
++    private static NewTopic topic(String name, EdaKafkaProperties.Topics settings) {
++        return TopicBuilder.name(name).partitions(settings.partitions()).replicas(settings.replicas()).build();
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/config/ProcessProperties.java b/order-process/src/main/java/cz/demo/eda/process/config/ProcessProperties.java
+new file mode 100644
+index 0000000..ac01e99
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/config/ProcessProperties.java
+@@ -0,0 +1,22 @@
++package cz.demo.eda.process.config;
++
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.boot.context.properties.bind.DefaultValue;
++
++import java.time.Duration;
++
++/**
++ * Nastavení napojení na proces.
++ *
++ * @param messageTtl jak dlouho Zeebe drží publikovanou zprávu, než ji někdo zkoreluje – pokryje
++ *                   výsledek platby, který předběhne proces, a po tuto dobu deduplikuje stejné messageId
++ */
++@ConfigurationProperties("eda.process")
++public record ProcessProperties(@DefaultValue("1m") Duration messageTtl) {
++
++    public ProcessProperties {
++        if (messageTtl == null || messageTtl.isNegative() || messageTtl.isZero()) {
++            throw new IllegalArgumentException("eda.process.message-ttl must be positive");
++        }
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/CancelOrder.java b/order-process/src/main/java/cz/demo/eda/process/event/CancelOrder.java
+new file mode 100644
+index 0000000..8b66b70
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/CancelOrder.java
+@@ -0,0 +1,20 @@
++package cz.demo.eda.process.event;
++
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Platba byla zamítnuta – objednávku zrušit. */
++public record CancelOrder(
++        UUID eventId,
++        Instant timestamp,
++        String correlationId,
++        String orderId,
++        String reason) implements OrderCommand {
++
++    public CancelOrder {
++        Objects.requireNonNull(eventId, "eventId");
++        Objects.requireNonNull(timestamp, "timestamp");
++        Objects.requireNonNull(orderId, "orderId");
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/ConfirmOrder.java b/order-process/src/main/java/cz/demo/eda/process/event/ConfirmOrder.java
+new file mode 100644
+index 0000000..90af267
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/ConfirmOrder.java
+@@ -0,0 +1,20 @@
++package cz.demo.eda.process.event;
++
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Platba proběhla – objednávku potvrdit. */
++public record ConfirmOrder(
++        UUID eventId,
++        Instant timestamp,
++        String correlationId,
++        String orderId,
++        String paymentId) implements OrderCommand {
++
++    public ConfirmOrder {
++        Objects.requireNonNull(eventId, "eventId");
++        Objects.requireNonNull(timestamp, "timestamp");
++        Objects.requireNonNull(orderId, "orderId");
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/DomainEvent.java b/order-process/src/main/java/cz/demo/eda/process/event/DomainEvent.java
+new file mode 100644
+index 0000000..fd3fe92
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/DomainEvent.java
+@@ -0,0 +1,17 @@
++package cz.demo.eda.process.event;
++
++import java.time.Instant;
++import java.util.UUID;
++
++/** Společná metadata všech zpráv; eventId slouží konzumentům k deduplikaci. */
++public interface DomainEvent {
++
++    UUID eventId();
++
++    Instant timestamp();
++
++    String correlationId();
++
++    /** Klíč zprávy v Kafce – zaručuje pořadí událostí jedné objednávky v rámci partition. */
++    String orderId();
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/OrderCommand.java b/order-process/src/main/java/cz/demo/eda/process/event/OrderCommand.java
+new file mode 100644
+index 0000000..12521b5
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/OrderCommand.java
+@@ -0,0 +1,15 @@
++package cz.demo.eda.process.event;
++
++import com.fasterxml.jackson.annotation.JsonSubTypes;
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++
++/**
++ * Příkaz pro order-service. Oba podtypy sdílí jeden topic, proto nesou v JSON diskriminátor {@code type}.
++ */
++@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type")
++@JsonSubTypes({
++        @JsonSubTypes.Type(value = ConfirmOrder.class, name = "ConfirmOrder"),
++        @JsonSubTypes.Type(value = CancelOrder.class, name = "CancelOrder")
++})
++public sealed interface OrderCommand extends DomainEvent permits ConfirmOrder, CancelOrder {
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/OrderCreated.java b/order-process/src/main/java/cz/demo/eda/process/event/OrderCreated.java
+new file mode 100644
+index 0000000..68adecd
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/OrderCreated.java
+@@ -0,0 +1,22 @@
++package cz.demo.eda.process.event;
++
++import java.math.BigDecimal;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Událost order-service o založení objednávky – spouští proces. */
++public record OrderCreated(
++        UUID eventId,
++        Instant timestamp,
++        String correlationId,
++        String orderId,
++        String customerId,
++        BigDecimal amount,
++        String currency) implements DomainEvent {
++
++    public OrderCreated {
++        Objects.requireNonNull(eventId, "eventId");
++        Objects.requireNonNull(orderId, "orderId");
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/PaymentCompleted.java b/order-process/src/main/java/cz/demo/eda/process/event/PaymentCompleted.java
+new file mode 100644
+index 0000000..dccefb4
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/PaymentCompleted.java
+@@ -0,0 +1,21 @@
++package cz.demo.eda.process.event;
++
++import java.math.BigDecimal;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Platba proběhla úspěšně. */
++public record PaymentCompleted(
++        UUID eventId,
++        Instant timestamp,
++        String correlationId,
++        String orderId,
++        String paymentId,
++        BigDecimal amount) implements PaymentResult {
++
++    public PaymentCompleted {
++        Objects.requireNonNull(eventId, "eventId");
++        Objects.requireNonNull(orderId, "orderId");
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/PaymentFailed.java b/order-process/src/main/java/cz/demo/eda/process/event/PaymentFailed.java
+new file mode 100644
+index 0000000..47aee5a
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/PaymentFailed.java
+@@ -0,0 +1,19 @@
++package cz.demo.eda.process.event;
++
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Platba byla zamítnuta (business výsledek). */
++public record PaymentFailed(
++        UUID eventId,
++        Instant timestamp,
++        String correlationId,
++        String orderId,
++        String reason) implements PaymentResult {
++
++    public PaymentFailed {
++        Objects.requireNonNull(eventId, "eventId");
++        Objects.requireNonNull(orderId, "orderId");
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/PaymentResult.java b/order-process/src/main/java/cz/demo/eda/process/event/PaymentResult.java
+new file mode 100644
+index 0000000..f5f7600
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/PaymentResult.java
+@@ -0,0 +1,13 @@
++package cz.demo.eda.process.event;
++
++import com.fasterxml.jackson.annotation.JsonSubTypes;
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++
++/** Výsledek platby od payment-service; podtyp určuje pole {@code type}. */
++@JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type")
++@JsonSubTypes({
++        @JsonSubTypes.Type(value = PaymentCompleted.class, name = "PaymentCompleted"),
++        @JsonSubTypes.Type(value = PaymentFailed.class, name = "PaymentFailed")
++})
++public sealed interface PaymentResult extends DomainEvent permits PaymentCompleted, PaymentFailed {
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/event/ProcessPayment.java b/order-process/src/main/java/cz/demo/eda/process/event/ProcessPayment.java
+new file mode 100644
+index 0000000..19c9ade
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/event/ProcessPayment.java
+@@ -0,0 +1,23 @@
++package cz.demo.eda.process.event;
++
++import java.math.BigDecimal;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Příkaz pro payment-service: proveď platbu za objednávku. */
++public record ProcessPayment(
++        UUID eventId,
++        Instant timestamp,
++        String correlationId,
++        String orderId,
++        BigDecimal amount,
++        String currency) implements DomainEvent {
++
++    public ProcessPayment {
++        Objects.requireNonNull(eventId, "eventId");
++        Objects.requireNonNull(timestamp, "timestamp");
++        Objects.requireNonNull(orderId, "orderId");
++        Objects.requireNonNull(amount, "amount");
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/support/CorrelationIdRecordInterceptor.java b/order-process/src/main/java/cz/demo/eda/process/support/CorrelationIdRecordInterceptor.java
+new file mode 100644
+index 0000000..4bf74aa
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/support/CorrelationIdRecordInterceptor.java
+@@ -0,0 +1,29 @@
++package cz.demo.eda.process.support;
++
++import org.apache.kafka.clients.consumer.Consumer;
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.apache.kafka.common.header.Header;
++import org.slf4j.MDC;
++import org.springframework.kafka.listener.RecordInterceptor;
++import org.springframework.stereotype.Component;
++
++import java.nio.charset.StandardCharsets;
++
++/** Přenese correlationId z Kafka hlavičky do MDC po dobu zpracování záznamu (včetně retry a DLT logů). */
++@Component
++public class CorrelationIdRecordInterceptor implements RecordInterceptor<Object, Object> {
++
++    @Override
++    public ConsumerRecord<Object, Object> intercept(ConsumerRecord<Object, Object> record, Consumer<Object, Object> consumer) {
++        Header header = record.headers().lastHeader(Tracing.CORRELATION_ID_HEADER);
++        if (header != null && header.value() != null) {
++            MDC.put(Tracing.CORRELATION_ID_MDC_KEY, new String(header.value(), StandardCharsets.UTF_8));
++        }
++        return record;
++    }
++
++    @Override
++    public void afterRecord(ConsumerRecord<Object, Object> record, Consumer<Object, Object> consumer) {
++        MDC.remove(Tracing.CORRELATION_ID_MDC_KEY);
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/support/Topics.java b/order-process/src/main/java/cz/demo/eda/process/support/Topics.java
+new file mode 100644
+index 0000000..27879ad
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/support/Topics.java
+@@ -0,0 +1,20 @@
++package cz.demo.eda.process.support;
++
++/** Názvy Kafka topiců – součást kontraktu s ostatními službami, musí odpovídat jejich konfiguraci. */
++public final class Topics {
++
++    public static final String ORDERS_CREATED = "orders.created";
++    public static final String PAYMENTS_COMMANDS = "payments.commands";
++    public static final String PAYMENTS_RESULT = "payments.result";
++    public static final String ORDERS_COMMANDS = "orders.commands";
++    /** Suffix dead letter topiců; resolver v konzumentech jej používá explicitně. */
++    public static final String DLT_SUFFIX = ".DLT";
++
++    private Topics() {
++    }
++
++    /** Vrátí název dead letter topicu pro zadaný topic. */
++    public static String dltOf(String topic) {
++        return topic + DLT_SUFFIX;
++    }
++}
+diff --git a/order-process/src/main/java/cz/demo/eda/process/support/Tracing.java b/order-process/src/main/java/cz/demo/eda/process/support/Tracing.java
+new file mode 100644
+index 0000000..408f0c9
+--- /dev/null
++++ b/order-process/src/main/java/cz/demo/eda/process/support/Tracing.java
+@@ -0,0 +1,11 @@
++package cz.demo.eda.process.support;
++
++/** Klíče pro propagaci correlationId přes HTTP, Kafka hlavičky a MDC. */
++public final class Tracing {
++
++    public static final String CORRELATION_ID_HEADER = "X-Correlation-Id";
++    public static final String CORRELATION_ID_MDC_KEY = "correlationId";
++
++    private Tracing() {
++    }
++}
+diff --git a/order-process/src/main/resources/application.yml b/order-process/src/main/resources/application.yml
+new file mode 100644
+index 0000000..ded2a40
+--- /dev/null
++++ b/order-process/src/main/resources/application.yml
+@@ -0,0 +1,78 @@
++spring:
++  application:
++    name: order-process
++  # Virtuální vlákna vypnutá ze stejného důvodu jako v ostatních službách (pinning Kafka consumeru na Java 21).
++  kafka:
++    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
++    admin:
++      fail-fast: true
++    producer:
++      acks: all
++      key-serializer: org.apache.kafka.common.serialization.StringSerializer
++      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
++      properties:
++        enable.idempotence: true
++        spring.json.add.type.headers: false
++    consumer:
++      group-id: order-process
++      auto-offset-reset: earliest
++      enable-auto-commit: false
++      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
++      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
++      properties:
++        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
++        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
++        # Výchozí typ nastavuje každý listener sám (dva topicy, dva typy).
++        spring.json.use.type.headers: false
++        spring.json.trusted.packages: cz.demo.eda.process.event
++    listener:
++      # Offset se commitne až po úspěšném publishMessage do Zeebe.
++      ack-mode: record
++      concurrency: 3
++
++camunda:
++  client:
++    mode: self-managed
++    auth:
++      method: none
++    rest-address: ${CAMUNDA_REST_ADDRESS:http://localhost:8088}
++    grpc-address: ${CAMUNDA_GRPC_ADDRESS:http://localhost:26500}
++    # gRPC kvůli jednoznačnému kódu ALREADY_EXISTS při duplicitním messageId (ProcessGateway).
++    prefer-rest-over-grpc: false
++
++eda:
++  process:
++    message-ttl: 1m
++  kafka:
++    topics:
++      partitions: 3
++      replicas: 1
++    retry:
++      max-retries: 3
++      initial-interval: 500ms
++      multiplier: 2.0
++      max-interval: 5s
++
++server:
++  shutdown: graceful
++
++management:
++  endpoints:
++    web:
++      exposure:
++        include: health,info,prometheus,metrics
++  endpoint:
++    health:
++      probes:
++        enabled: true
++  metrics:
++    tags:
++      application: ${spring.application.name}
++
++logging:
++  structured:
++    format:
++      console: ecs
++    ecs:
++      service:
++        name: ${spring.application.name}
+diff --git a/order-process/src/test/java/cz/demo/eda/process/config/ProcessPropertiesTest.java b/order-process/src/test/java/cz/demo/eda/process/config/ProcessPropertiesTest.java
+new file mode 100644
+index 0000000..3255a5b
+--- /dev/null
++++ b/order-process/src/test/java/cz/demo/eda/process/config/ProcessPropertiesTest.java
+@@ -0,0 +1,30 @@
++package cz.demo.eda.process.config;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.time.Duration;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
++
++class ProcessPropertiesTest {
++
++    @Test
++    @DisplayName("Přijme kladné TTL zprávy")
++    void should_keepTtl_whenPositive() {
++        assertThat(new ProcessProperties(Duration.ofMinutes(1)).messageTtl()).isEqualTo(Duration.ofMinutes(1));
++    }
++
++    @Test
++    @DisplayName("Odmítne nulové TTL – zpráva, která předběhne proces, by se ztratila")
++    void should_reject_whenTtlIsZero() {
++        assertThatIllegalArgumentException().isThrownBy(() -> new ProcessProperties(Duration.ZERO));
++    }
++
++    @Test
++    @DisplayName("Odmítne chybějící TTL")
++    void should_reject_whenTtlIsNull() {
++        assertThatIllegalArgumentException().isThrownBy(() -> new ProcessProperties(null));
++    }
++}
+diff --git a/order-process/src/test/java/cz/demo/eda/process/event/EventSerializationTest.java b/order-process/src/test/java/cz/demo/eda/process/event/EventSerializationTest.java
+new file mode 100644
+index 0000000..d6fbb17
+--- /dev/null
++++ b/order-process/src/test/java/cz/demo/eda/process/event/EventSerializationTest.java
+@@ -0,0 +1,73 @@
++package cz.demo.eda.process.event;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import tools.jackson.databind.json.JsonMapper;
++
++import java.math.BigDecimal;
++import java.time.Instant;
++import java.util.UUID;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatNullPointerException;
++
++class EventSerializationTest {
++
++    private static final UUID ID = UUID.fromString("5b7c0000-0000-4000-8000-000000000001");
++    private static final Instant TS = Instant.parse("2026-10-08T10:00:00Z");
++
++    private final JsonMapper mapper = JsonMapper.builder().build();
++
++    @Test
++    @DisplayName("Přečte OrderCreated v JSON formátu, který publikuje order-service")
++    void should_readOrderCreated_whenJsonFromOrderService() {
++        String json = """
++                {"eventId":"5b7c0000-0000-4000-8000-000000000001","timestamp":"2026-10-08T10:00:00Z",
++                 "correlationId":"demo-1","orderId":"o-1","customerId":"c1","amount":10.5,"currency":"CZK"}""";
++
++        OrderCreated event = mapper.readValue(json, OrderCreated.class);
++
++        assertThat(event).isEqualTo(new OrderCreated(ID, TS, "demo-1", "o-1", "c1", new BigDecimal("10.5"), "CZK"));
++    }
++
++    @Test
++    @DisplayName("PaymentResult se deserializuje na podtyp podle pole type")
++    void should_deserializeSubtype_whenReadAsPaymentResult() {
++        String completed = """
++                {"type":"PaymentCompleted","eventId":"5b7c0000-0000-4000-8000-000000000001",
++                 "timestamp":"2026-10-08T10:00:00Z","correlationId":"c","orderId":"o-1","paymentId":"p-1","amount":10}""";
++        String failed = """
++                {"type":"PaymentFailed","eventId":"5b7c0000-0000-4000-8000-000000000001",
++                 "timestamp":"2026-10-08T10:00:00Z","correlationId":"c","orderId":"o-1","reason":"declined"}""";
++
++        assertThat(mapper.readValue(completed, PaymentResult.class))
++                .isEqualTo(new PaymentCompleted(ID, TS, "c", "o-1", "p-1", BigDecimal.TEN));
++        assertThat(mapper.readValue(failed, PaymentResult.class))
++                .isEqualTo(new PaymentFailed(ID, TS, "c", "o-1", "declined"));
++    }
++
++    @Test
++    @DisplayName("ProcessPayment se serializuje bez pole type a se všemi poli kontraktu")
++    void should_writeProcessPaymentContract_whenSerialized() {
++        String json = mapper.writeValueAsString(new ProcessPayment(ID, TS, "c", "o-1", BigDecimal.TEN, "CZK"));
++
++        assertThat(json).contains("\"eventId\":\"" + ID + "\"", "\"orderId\":\"o-1\"", "\"amount\":10",
++                "\"currency\":\"CZK\"", "\"correlationId\":\"c\"").doesNotContain("\"type\"");
++    }
++
++    @Test
++    @DisplayName("Příkazy pro objednávku nesou diskriminátor type")
++    void should_writeTypeDiscriminator_whenOrderCommandSerialized() {
++        OrderCommand confirm = new ConfirmOrder(ID, TS, "c", "o-1", "p-1");
++        OrderCommand cancel = new CancelOrder(ID, TS, "c", "o-1", "declined");
++
++        assertThat(mapper.writeValueAsString(confirm)).contains("\"type\":\"ConfirmOrder\"", "\"paymentId\":\"p-1\"");
++        assertThat(mapper.writeValueAsString(cancel)).contains("\"type\":\"CancelOrder\"", "\"reason\":\"declined\"");
++    }
++
++    @Test
++    @DisplayName("Vyhodí výjimku když příkaz nemá orderId")
++    void should_throw_whenCommandOrderIdIsNull() {
++        assertThatNullPointerException().isThrownBy(() -> new ProcessPayment(ID, TS, "c", null, BigDecimal.ONE, "CZK"));
++    }
++}
+diff --git a/order-process/src/test/java/cz/demo/eda/process/support/CorrelationIdRecordInterceptorTest.java b/order-process/src/test/java/cz/demo/eda/process/support/CorrelationIdRecordInterceptorTest.java
+new file mode 100644
+index 0000000..72120d4
+--- /dev/null
++++ b/order-process/src/test/java/cz/demo/eda/process/support/CorrelationIdRecordInterceptorTest.java
+@@ -0,0 +1,45 @@
++package cz.demo.eda.process.support;
++
++import org.apache.kafka.clients.consumer.ConsumerRecord;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.slf4j.MDC;
++
++import java.nio.charset.StandardCharsets;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++class CorrelationIdRecordInterceptorTest {
++
++    private final CorrelationIdRecordInterceptor interceptor = new CorrelationIdRecordInterceptor();
++
++    @AfterEach
++    void clearMdc() {
++        MDC.clear();
++    }
++
++    @Test
++    @DisplayName("Vloží correlationId z hlavičky do MDC a po zpracování ho odstraní")
++    void should_putAndRemoveMdc_whenHeaderPresent() {
++        ConsumerRecord<Object, Object> record = new ConsumerRecord<Object, Object>("t", 0, 0, "k", "v");
++        record.headers().add(Tracing.CORRELATION_ID_HEADER, "corr-9".getBytes(StandardCharsets.UTF_8));
++
++        ConsumerRecord<Object, Object> returned = interceptor.intercept(record, null);
++
++        assertThat(returned).isSameAs(record);
++        assertThat(MDC.get(Tracing.CORRELATION_ID_MDC_KEY)).isEqualTo("corr-9");
++        interceptor.afterRecord(record, null);
++        assertThat(MDC.get(Tracing.CORRELATION_ID_MDC_KEY)).isNull();
++    }
++
++    @Test
++    @DisplayName("Bez hlavičky MDC nezmění")
++    void should_leaveMdcEmpty_whenHeaderMissing() {
++        ConsumerRecord<Object, Object> record = new ConsumerRecord<Object, Object>("t", 0, 0, "k", "v");
++
++        interceptor.intercept(record, null);
++
++        assertThat(MDC.get(Tracing.CORRELATION_ID_MDC_KEY)).isNull();
++    }
++}
+diff --git a/order-process/src/test/java/cz/demo/eda/process/support/TopicsTest.java b/order-process/src/test/java/cz/demo/eda/process/support/TopicsTest.java
+new file mode 100644
+index 0000000..58b9a87
+--- /dev/null
++++ b/order-process/src/test/java/cz/demo/eda/process/support/TopicsTest.java
+@@ -0,0 +1,21 @@
++package cz.demo.eda.process.support;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++class TopicsTest {
++
++    @Test
++    @DisplayName("Vrátí název DLT topicu s příponou .DLT")
++    void should_appendDltSuffix_whenTopicGiven() {
++        assertThat(Topics.dltOf(Topics.PAYMENTS_RESULT)).isEqualTo("payments.result.DLT");
++    }
++
++    @Test
++    @DisplayName("Pro prázdný název vrátí jen příponu")
++    void should_returnSuffixOnly_whenTopicIsEmpty() {
++        assertThat(Topics.dltOf("")).isEqualTo(".DLT");
++    }
++}
+diff --git a/pom.xml b/pom.xml
+index b9da4f7..7e532fd 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -6,12 +6,13 @@
+ 
+     <!-- Jen agregátor pro pohodlný build celého repa; služby od něj nic nedědí a jsou samostatné projekty. -->
+     <groupId>cz.demo.eda</groupId>
+     <artifactId>event-driven-demo</artifactId>
+     <version>0.0.1-SNAPSHOT</version>
+     <packaging>pom</packaging>
+ 
+     <modules>
+         <module>order-service</module>
+         <module>payment-service</module>
++        <module>order-process</module>
+     </modules>
+ </project>

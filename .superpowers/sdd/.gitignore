@@ -1,0 +1,4 @@
+# Pracovní snapshoty stromu (kopie zdrojáků po každém tasku) a runtime logy – jen pro lokální review, do gitu nepatří.
+snap-*/
+pf.log
+final-test.log

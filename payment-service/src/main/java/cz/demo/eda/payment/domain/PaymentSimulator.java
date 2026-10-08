@@ -1,6 +1,6 @@
 package cz.demo.eda.payment.domain;
 
-import cz.demo.eda.payment.event.OrderCreated;
+import cz.demo.eda.payment.event.ProcessPayment;
 import cz.demo.eda.payment.event.PaymentCompleted;
 import cz.demo.eda.payment.event.PaymentFailed;
 import cz.demo.eda.payment.event.PaymentResult;
@@ -28,7 +28,7 @@ public class PaymentSimulator {
      *
      * @throws PaymentProcessingException pokud částka odpovídá nastavené poison částce
      */
-    public PaymentResult process(OrderCreated order) {
+    public PaymentResult process(ProcessPayment order) {
         if (order.amount().compareTo(properties.poisonAmount()) == 0) {
             throw new PaymentProcessingException("Simulated gateway crash for poison amount " + order.amount()
                     + " (order " + order.orderId() + ")");

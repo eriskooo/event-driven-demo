@@ -1,8 +1,8 @@
 package cz.demo.eda.order.domain;
 
 import cz.demo.eda.order.event.OrderCreated;
-import cz.demo.eda.order.event.PaymentCompleted;
-import cz.demo.eda.order.event.PaymentFailed;
+import cz.demo.eda.order.event.CancelOrder;
+import cz.demo.eda.order.event.ConfirmOrder;
 import cz.demo.eda.order.outbox.OutboxPublisher;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -59,12 +59,12 @@ class OrderServiceTest {
     }
 
     @Test
-    @DisplayName("PaymentCompleted převede objednávku do stavu PAID")
-    void should_markPaid_whenPaymentCompleted() {
+    @DisplayName("ConfirmOrder převede objednávku do stavu PAID")
+    void should_markPaid_whenConfirmOrder() {
         Order order = pending();
         when(repository.findForUpdate("o-1")).thenReturn(Optional.of(order));
 
-        service.applyPaymentResult(PaymentCompleted.of("corr", "o-1", "p-1", BigDecimal.TEN));
+        service.applyCommand(ConfirmOrder.of("corr", "o-1", "p-1"));
 
         assertThat(order.status()).isEqualTo(OrderStatus.PAID);
         assertThat(order.paymentId()).isEqualTo("p-1");
@@ -72,36 +72,36 @@ class OrderServiceTest {
     }
 
     @Test
-    @DisplayName("PaymentFailed převede objednávku do stavu PAYMENT_FAILED s důvodem")
-    void should_markFailed_whenPaymentFailed() {
+    @DisplayName("CancelOrder převede objednávku do stavu PAYMENT_FAILED s důvodem")
+    void should_markFailed_whenCancelOrder() {
         Order order = pending();
         when(repository.findForUpdate("o-1")).thenReturn(Optional.of(order));
 
-        service.applyPaymentResult(PaymentFailed.of("corr", "o-1", "declined"));
+        service.applyCommand(CancelOrder.of("corr", "o-1", "declined"));
 
         assertThat(order.status()).isEqualTo(OrderStatus.PAYMENT_FAILED);
         assertThat(order.failureReason()).isEqualTo("declined");
     }
 
     @Test
-    @DisplayName("Finální stav se dalším výsledkem platby nezmění")
-    void should_keepFinalState_whenSecondResultArrives() {
+    @DisplayName("Finální stav se dalším příkazem nezmění")
+    void should_keepFinalState_whenSecondCommandArrives() {
         Order order = pending();
         order.markPaid("p-1", NOW);
         when(repository.findForUpdate("o-1")).thenReturn(Optional.of(order));
 
-        service.applyPaymentResult(PaymentFailed.of("corr", "o-1", "late"));
+        service.applyCommand(CancelOrder.of("corr", "o-1", "late"));
 
         assertThat(order.status()).isEqualTo(OrderStatus.PAID);
         assertThat(order.failureReason()).isNull();
     }
 
     @Test
-    @DisplayName("Výsledek platby pro neznámou objednávku vrátí prázdno")
+    @DisplayName("Příkaz pro neznámou objednávku vrátí prázdno")
     void should_returnEmpty_whenOrderUnknown() {
         when(repository.findForUpdate("unknown")).thenReturn(Optional.empty());
 
-        assertThat(service.applyPaymentResult(PaymentFailed.of("corr", "unknown", "x"))).isEmpty();
+        assertThat(service.applyCommand(CancelOrder.of("corr", "unknown", "x"))).isEmpty();
     }
 
     @Test

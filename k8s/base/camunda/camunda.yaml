@@ -1,0 +1,159 @@
+# Camunda 8 Orchestration Cluster (Zeebe + Operate + Tasklist v jednom kontejneru), 1 broker.
+# Primární úložiště (log událostí + RocksDB) je na PVC – to je zdroj pravdy o běžících instancích.
+# Vedlejší úložiště pro Operate/Tasklist/search API je databáze "camunda" v PostgreSQL (plní ji exportér).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: camunda-config
+  labels:
+    app.kubernetes.io/name: camunda
+data:
+  application.yaml: |
+    camunda:
+      system:
+        cpu-thread-count: "2"
+        io-thread-count: "2"
+      security:
+        authentication:
+          method: basic
+          # Workery a listenery v namespace se připojují bez přihlášení – jen pro demo.
+          unprotectedApi: true
+        authorizations:
+          enabled: false
+        initialization:
+          users:
+            - username: demo
+              password: demo
+              name: Demo User
+              email: demo@demo.com
+          defaultRoles.admin.users:
+            - demo
+      data:
+        secondary-storage:
+          type: rdbms
+          rdbms:
+            url: jdbc:postgresql://postgres:5432/camunda
+            username: camunda
+            password: ${CAMUNDA_DB_PASSWORD}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: camunda
+  labels:
+    app.kubernetes.io/name: camunda
+spec:
+  serviceName: camunda
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: camunda
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: camunda
+        app.kubernetes.io/part-of: eda-demo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "9600"
+    spec:
+      securityContext:
+        # Image běží jako uživatel 1001 – PVC musí být zapisovatelné pro jeho skupinu.
+        fsGroup: 1001
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.37.0
+          command: ["sh", "-c", "until nc -z postgres 5432; do echo waiting for postgres; sleep 2; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: camunda
+          image: camunda/camunda:8.10.2
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 26500
+            - name: management
+              containerPort: 9600
+          env:
+            - name: CAMUNDA_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: camunda-db
+                  key: password
+            - name: JAVA_TOOL_OPTIONS
+              value: -XX:MaxRAMPercentage=60 -XX:+ExitOnOutOfMemoryError
+          volumeMounts:
+            - name: data
+              mountPath: /usr/local/camunda/data
+            - name: config
+              mountPath: /usr/local/camunda/config/application.yaml
+              subPath: application.yaml
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: management
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: management
+            timeoutSeconds: 3
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: management
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: config
+          configMap:
+            name: camunda-config
+  # Běžící instance procesů přežijí restart podu; smaže je až teardown (smazání namespace).
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: camunda
+  labels:
+    app.kubernetes.io/name: camunda
+spec:
+  selector:
+    app.kubernetes.io/name: camunda
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: grpc
+      port: 26500
+      targetPort: grpc
+    - name: management
+      port: 9600
+      targetPort: management

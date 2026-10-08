@@ -15,7 +15,7 @@
     <artifactId>order-service</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>order-service</name>
-    <description>REST API objednávek, publikuje OrderCreated a zpracovává výsledky plateb</description>
+    <description>REST API objednávek, publikuje OrderCreated a provádí příkazy orchestrátoru</description>
 
     <properties>
         <java.version>21</java.version>

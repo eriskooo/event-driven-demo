@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-process-config
+  labels:
+    app.kubernetes.io/name: order-process
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  CAMUNDA_REST_ADDRESS: http://camunda:8080
+  CAMUNDA_GRPC_ADDRESS: http://camunda:26500
+  # Heap jen 60 % limitu – zbytek potřebuje metaspace, vlákna, gRPC a direct buffery Kafka klienta.
+  JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=60 -XX:+ExitOnOutOfMemoryError
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-process
+  labels:
+    app.kubernetes.io/name: order-process
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-process
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: order-process
+        app.kubernetes.io/part-of: eda-demo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "8080"
+    spec:
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # Čeká na Kafku a Zeebe: KafkaAdmin při startu vytváří topicy a @Deployment nasazuje BPMN –
+        # bez nich by pod skončil v CrashLoopBackOff s rostoucí prodlevou restartů.
+        - name: wait-for-dependencies
+          image: busybox:1.37.0
+          command: ["sh", "-c", "until nc -z kafka 9092 && nc -z camunda 26500; do echo waiting for kafka and camunda; sleep 2; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: order-process
+          image: order-process:dev
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: order-process-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 36
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            # Výchozí 1 s je při startu JVM na vytíženém laptopu málo.
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-process
+  labels:
+    app.kubernetes.io/name: order-process
+spec:
+  selector:
+    app.kubernetes.io/name: order-process
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

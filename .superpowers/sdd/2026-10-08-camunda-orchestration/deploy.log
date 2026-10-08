@@ -1,0 +1,287 @@
+>> Namespace eda-demo removed (incl. PostgreSQL data). Local Docker images are kept.
+>> Building order-service:dev
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.13kB 0.0s done
+#1 DONE 0.0s
+
+#2 resolve image config for docker-image://docker.io/docker/dockerfile:1
+#2 DONE 0.9s
+
+#3 docker-image://docker.io/docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+#3 CACHED
+
+#4 [internal] load metadata for docker.io/library/maven:3.9-eclipse-temurin-21-noble
+#4 DONE 0.7s
+
+#5 [internal] load metadata for docker.io/library/eclipse-temurin:21-jre-noble
+#5 DONE 0.7s
+
+#6 [internal] load .dockerignore
+#6 transferring context: 61B done
+#6 DONE 0.0s
+
+#7 [build 1/5] FROM docker.io/library/maven:3.9-eclipse-temurin-21-noble@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320
+#7 DONE 0.0s
+
+#8 [extract 1/4] FROM docker.io/library/eclipse-temurin:21-jre-noble@sha256:000fd431958bc81a24abe1e8e5f0f0fd3ae365a594bd50aadb20696805f9408c
+#8 DONE 0.0s
+
+#9 [internal] load build context
+#9 transferring context: 54.80kB 0.0s done
+#9 DONE 0.0s
+
+#10 [build 2/5] WORKDIR /workspace
+#10 CACHED
+
+#11 [build 3/5] COPY pom.xml .
+#11 DONE 0.1s
+
+#12 [build 4/5] COPY src src
+#12 DONE 0.1s
+
+#13 [build 5/5] RUN --mount=type=cache,target=/root/.m2 mvn -B -q package -DskipTests
+#13 DONE 10.4s
+
+#14 [extract 2/4] WORKDIR /extract
+#14 CACHED
+
+#15 [extract 3/4] COPY --from=build /workspace/target/app.jar app.jar
+#15 DONE 0.2s
+
+#16 [extract 4/4] RUN java -Djarmode=tools -jar app.jar extract --layers --launcher --destination layers
+#16 DONE 1.5s
+
+#17 [stage-2 2/7] WORKDIR /app
+#17 CACHED
+
+#18 [stage-2 3/7] RUN useradd --system --uid 10001 --no-create-home spring
+#18 CACHED
+
+#19 [stage-2 4/7] COPY --from=extract /extract/layers/dependencies/ ./
+#19 CACHED
+
+#20 [stage-2 5/7] COPY --from=extract /extract/layers/spring-boot-loader/ ./
+#20 CACHED
+
+#21 [stage-2 6/7] COPY --from=extract /extract/layers/snapshot-dependencies/ ./
+#21 CACHED
+
+#22 [stage-2 7/7] COPY --from=extract /extract/layers/application/ ./
+#22 DONE 0.1s
+
+#23 exporting to image
+#23 exporting layers 0.1s done
+#23 writing image sha256:8d0f6d1a19d8e590cf1e9bb360813c631a8a60cd9b969dff5d4fecf47b9f984a done
+#23 naming to docker.io/library/order-service:dev done
+#23 DONE 0.1s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/ondkdlgvrxpztwqsfb89ewm36
+>> Building payment-service:dev
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.13kB done
+#1 DONE 0.0s
+
+#2 resolve image config for docker-image://docker.io/docker/dockerfile:1
+#2 DONE 0.2s
+
+#3 docker-image://docker.io/docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+#3 CACHED
+
+#4 [internal] load metadata for docker.io/library/eclipse-temurin:21-jre-noble
+#4 DONE 0.2s
+
+#5 [internal] load metadata for docker.io/library/maven:3.9-eclipse-temurin-21-noble
+#5 DONE 0.2s
+
+#6 [internal] load .dockerignore
+#6 transferring context: 61B done
+#6 DONE 0.0s
+
+#7 [extract 1/4] FROM docker.io/library/eclipse-temurin:21-jre-noble@sha256:000fd431958bc81a24abe1e8e5f0f0fd3ae365a594bd50aadb20696805f9408c
+#7 DONE 0.0s
+
+#8 [build 1/5] FROM docker.io/library/maven:3.9-eclipse-temurin-21-noble@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320
+#8 DONE 0.0s
+
+#9 [internal] load build context
+#9 transferring context: 69.89kB 0.0s done
+#9 DONE 0.0s
+
+#10 [build 2/5] WORKDIR /workspace
+#10 CACHED
+
+#11 [build 3/5] COPY pom.xml .
+#11 DONE 0.1s
+
+#12 [build 4/5] COPY src src
+#12 DONE 0.1s
+
+#13 [build 5/5] RUN --mount=type=cache,target=/root/.m2 mvn -B -q package -DskipTests
+#13 DONE 9.0s
+
+#14 [extract 2/4] WORKDIR /extract
+#14 CACHED
+
+#15 [extract 3/4] COPY --from=build /workspace/target/app.jar app.jar
+#15 DONE 0.2s
+
+#16 [extract 4/4] RUN java -Djarmode=tools -jar app.jar extract --layers --launcher --destination layers
+#16 DONE 1.3s
+
+#17 [stage-2 2/7] WORKDIR /app
+#17 CACHED
+
+#18 [stage-2 3/7] RUN useradd --system --uid 10001 --no-create-home spring
+#18 CACHED
+
+#19 [stage-2 4/7] COPY --from=extract /extract/layers/dependencies/ ./
+#19 CACHED
+
+#20 [stage-2 5/7] COPY --from=extract /extract/layers/spring-boot-loader/ ./
+#20 CACHED
+
+#21 [stage-2 6/7] COPY --from=extract /extract/layers/snapshot-dependencies/ ./
+#21 CACHED
+
+#22 [stage-2 7/7] COPY --from=extract /extract/layers/application/ ./
+#22 DONE 0.1s
+
+#23 exporting to image
+#23 exporting layers 0.1s done
+#23 writing image sha256:187c0103d26333efbd37509ba61b1af93cc0d3fac0da6863f222423caaebbfed done
+#23 naming to docker.io/library/payment-service:dev done
+#23 DONE 0.1s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/zjzdvg5ay8axmlyrbqypq4xbl
+>> Building order-process:dev
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.13kB done
+#1 DONE 0.0s
+
+#2 resolve image config for docker-image://docker.io/docker/dockerfile:1
+#2 DONE 0.3s
+
+#3 docker-image://docker.io/docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+#3 CACHED
+
+#4 [internal] load metadata for docker.io/library/eclipse-temurin:21-jre-noble
+#4 DONE 0.2s
+
+#5 [internal] load metadata for docker.io/library/maven:3.9-eclipse-temurin-21-noble
+#5 DONE 0.2s
+
+#6 [internal] load .dockerignore
+#6 transferring context: 61B done
+#6 DONE 0.0s
+
+#7 [build 1/5] FROM docker.io/library/maven:3.9-eclipse-temurin-21-noble@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320
+#7 DONE 0.0s
+
+#8 [extract 1/4] FROM docker.io/library/eclipse-temurin:21-jre-noble@sha256:000fd431958bc81a24abe1e8e5f0f0fd3ae365a594bd50aadb20696805f9408c
+#8 DONE 0.0s
+
+#9 [internal] load build context
+#9 transferring context: 89.74kB 0.0s done
+#9 DONE 0.1s
+
+#10 [build 2/5] WORKDIR /workspace
+#10 CACHED
+
+#11 [build 3/5] COPY pom.xml .
+#11 DONE 0.1s
+
+#12 [build 4/5] COPY src src
+#12 DONE 0.1s
+
+#13 [build 5/5] RUN --mount=type=cache,target=/root/.m2 mvn -B -q package -DskipTests
+#13 DONE 17.8s
+
+#14 [extract 2/4] WORKDIR /extract
+#14 CACHED
+
+#15 [extract 3/4] COPY --from=build /workspace/target/app.jar app.jar
+#15 DONE 0.2s
+
+#16 [extract 4/4] RUN java -Djarmode=tools -jar app.jar extract --layers --launcher --destination layers
+#16 DONE 1.5s
+
+#17 [stage-2 2/7] WORKDIR /app
+#17 CACHED
+
+#18 [stage-2 3/7] RUN useradd --system --uid 10001 --no-create-home spring
+#18 CACHED
+
+#19 [stage-2 4/7] COPY --from=extract /extract/layers/dependencies/ ./
+#19 DONE 0.3s
+
+#20 [stage-2 5/7] COPY --from=extract /extract/layers/spring-boot-loader/ ./
+#20 DONE 0.1s
+
+#21 [stage-2 6/7] COPY --from=extract /extract/layers/snapshot-dependencies/ ./
+#21 DONE 0.1s
+
+#22 [stage-2 7/7] COPY --from=extract /extract/layers/application/ ./
+#22 DONE 0.1s
+
+#23 exporting to image
+#23 exporting layers
+#23 exporting layers 0.3s done
+#23 writing image sha256:bd86188389dd906513cd2608db3022053bde92db3aff162db5c548c59f1ea730 done
+#23 naming to docker.io/library/order-process:dev done
+#23 DONE 0.3s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/s5jk1jp424rvgkbel1n2jkawn
+>> Done. Context docker-desktop uses local Docker images directly.
+>> Deploying profile 'base' (/c/projekty/tmp/event-driven-demo/k8s/base)
+namespace/eda-demo created
+configmap/camunda-config created
+configmap/order-process-config created
+configmap/order-service-config created
+configmap/payment-service-config created
+configmap/postgres-init created
+secret/camunda-db created
+secret/order-service-db created
+secret/payment-service-db created
+secret/postgres-admin created
+service/camunda created
+service/kafka created
+service/order-process created
+service/order-service created
+service/payment-service created
+service/postgres created
+deployment.apps/kafka created
+deployment.apps/order-process created
+deployment.apps/order-service created
+deployment.apps/payment-service created
+statefulset.apps/camunda created
+statefulset.apps/postgres created
+Waiting for 1 pods to be ready...
+partitioned roll out complete: 1 new pods have been updated...
+Waiting for deployment "kafka" rollout to finish: 0 of 1 updated replicas are available...
+deployment "kafka" successfully rolled out
+Waiting for 1 pods to be ready...
+partitioned roll out complete: 1 new pods have been updated...
+>> Waiting for deployment.apps/kafka
+deployment "kafka" successfully rolled out
+>> Waiting for deployment.apps/order-process
+Waiting for deployment "order-process" rollout to finish: 0 of 1 updated replicas are available...
+deployment "order-process" successfully rolled out
+>> Waiting for deployment.apps/order-service
+deployment "order-service" successfully rolled out
+>> Waiting for deployment.apps/payment-service
+deployment "payment-service" successfully rolled out
+NAME                              READY   STATUS    RESTARTS   AGE
+camunda-0                         1/1     Running   0          62s
+kafka-5ffd4dbcb9-4brtd            1/1     Running   0          62s
+order-process-559d94c5f7-w7zvf    1/1     Running   0          62s
+order-service-775b4b98dc-g5mj9    1/1     Running   0          62s
+payment-service-d8d9878d9-tg49f   1/1     Running   0          62s
+postgres-0                        1/1     Running   0          62s
+>> Deployed. Run scripts/port-forward.sh to access the services.
+exit=0

@@ -14,12 +14,12 @@ class EventSerializationTest {
     private final JsonMapper mapper = JsonMapper.builder().build();
 
     @Test
-    @DisplayName("OrderCreated projde JSON round-tripem beze ztráty dat")
-    void should_roundTripOrderCreated_whenSerialized() {
-        OrderCreated event = OrderCreated.of("corr-1", "order-1", "cust-1", new BigDecimal("12.50"), "CZK");
+    @DisplayName("ProcessPayment projde JSON round-tripem beze ztráty dat")
+    void should_roundTripProcessPayment_whenSerialized() {
+        ProcessPayment event = ProcessPayment.of("corr-1", "order-1", new BigDecimal("12.50"), "CZK");
 
         String json = mapper.writeValueAsString(event);
-        OrderCreated restored = mapper.readValue(json, OrderCreated.class);
+        ProcessPayment restored = mapper.readValue(json, ProcessPayment.class);
 
         assertThat(restored).isEqualTo(event);
         assertThat(json).contains("\"eventId\"", "\"timestamp\"", "\"correlationId\":\"corr-1\"");
@@ -43,7 +43,7 @@ class EventSerializationTest {
     @DisplayName("Vyhodí výjimku když chybí orderId")
     void should_throw_whenOrderIdIsNull() {
         assertThatNullPointerException()
-                .isThrownBy(() -> OrderCreated.of("c", null, "cust", BigDecimal.ONE, "CZK"));
+                .isThrownBy(() -> ProcessPayment.of("c", null, BigDecimal.ONE, "CZK"));
     }
 
     @Test

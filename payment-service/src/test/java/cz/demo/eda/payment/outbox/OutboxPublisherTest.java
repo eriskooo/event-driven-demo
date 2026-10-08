@@ -1,6 +1,6 @@
 package cz.demo.eda.payment.outbox;
 
-import cz.demo.eda.payment.event.OrderCreated;
+import cz.demo.eda.payment.event.ProcessPayment;
 import cz.demo.eda.payment.inbox.InboxEntry;
 import cz.demo.eda.payment.support.Tracing;
 import org.junit.jupiter.api.BeforeEach;
@@ -40,13 +40,13 @@ class OutboxPublisherTest {
     @Test
     @DisplayName("Událost uloží s klíčem orderId, JSON payloadem a hlavičkou correlationId")
     void should_storeEventAsJson_whenPublished() {
-        OrderCreated event = OrderCreated.of("corr-1", "o-1", "c-1", new BigDecimal("10.50"), "CZK");
+        ProcessPayment event = ProcessPayment.of("corr-1", "o-1", new BigDecimal("10.50"), "CZK");
 
-        publisher.publish("orders.created", event);
+        publisher.publish("payments.commands", event);
 
         OutboxEntry saved = captureSaved();
         assertThat(saved.eventId()).isEqualTo(event.eventId());
-        assertThat(saved.topic()).isEqualTo("orders.created");
+        assertThat(saved.topic()).isEqualTo("payments.commands");
         assertThat(saved.messageKey()).isEqualTo("o-1");
         assertThat(saved.payload()).contains("\"orderId\":\"o-1\"", "\"amount\":10.50", "\"eventId\"");
         assertThat(saved.headers()).containsExactlyEntriesOf(Map.of(Tracing.CORRELATION_ID_HEADER, "corr-1"));
@@ -56,7 +56,7 @@ class OutboxPublisherTest {
     @Test
     @DisplayName("Bez correlationId uloží prázdné hlavičky")
     void should_storeNoHeaders_whenCorrelationIdIsNull() {
-        publisher.publish("orders.created", OrderCreated.of(null, "o-1", "c-1", BigDecimal.ONE, "CZK"));
+        publisher.publish("payments.commands", ProcessPayment.of(null, "o-1", BigDecimal.ONE, "CZK"));
 
         assertThat(captureSaved().headers()).isEmpty();
     }
@@ -64,19 +64,19 @@ class OutboxPublisherTest {
     @Test
     @DisplayName("DLT zprávu pošle do <topic>.DLT s původním payloadem, počtem pokusů a důvodem selhání")
     void should_storeDeadLetterWithErrorHeaders_whenProcessingGaveUp() {
-        InboxEntry entry = InboxEntry.received(UUID.randomUUID(), "orders.created", "o-1", "{\"x\":1}", "corr-9", NOW);
+        InboxEntry entry = InboxEntry.received(UUID.randomUUID(), "payments.commands", "o-1", "{\"x\":1}", "corr-9", NOW);
         entry.markFailed("boom", NOW);
 
         publisher.publishDeadLetter(entry, new IllegalStateException("x".repeat(1500)));
 
         OutboxEntry saved = captureSaved();
-        assertThat(saved.topic()).isEqualTo("orders.created.DLT");
+        assertThat(saved.topic()).isEqualTo("payments.commands.DLT");
         assertThat(saved.eventId()).isEqualTo(entry.eventId());
         assertThat(saved.messageKey()).isEqualTo("o-1");
         assertThat(saved.payload()).isEqualTo("{\"x\":1}");
         assertThat(saved.headers())
                 .containsEntry(Tracing.CORRELATION_ID_HEADER, "corr-9")
-                .containsEntry(OutboxPublisher.DLT_ORIGINAL_TOPIC, "orders.created")
+                .containsEntry(OutboxPublisher.DLT_ORIGINAL_TOPIC, "payments.commands")
                 .containsEntry(OutboxPublisher.DLT_EXCEPTION_FQCN, IllegalStateException.class.getName())
                 .containsEntry(OutboxPublisher.DLT_ATTEMPTS, "1");
         assertThat(saved.headers().get(OutboxPublisher.DLT_EXCEPTION_MESSAGE)).hasSize(1000);

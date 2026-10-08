@@ -1,9 +1,9 @@
 package cz.demo.eda.order.domain;
 
+import cz.demo.eda.order.event.CancelOrder;
+import cz.demo.eda.order.event.ConfirmOrder;
+import cz.demo.eda.order.event.OrderCommand;
 import cz.demo.eda.order.event.OrderCreated;
-import cz.demo.eda.order.event.PaymentCompleted;
-import cz.demo.eda.order.event.PaymentFailed;
-import cz.demo.eda.order.event.PaymentResult;
 import cz.demo.eda.order.outbox.OutboxPublisher;
 import cz.demo.eda.order.support.Topics;
 import org.slf4j.Logger;
@@ -17,7 +17,7 @@ import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 
-/** Doménová logika objednávek: založení a reakce na výsledek platby. */
+/** Doménová logika objednávek: založení a provedení příkazů orchestrátoru. */
 @Service
 @Transactional
 public class OrderService {
@@ -49,32 +49,32 @@ public class OrderService {
     }
 
     /**
-     * Promítne výsledek platby do stavu objednávky; vrací prázdno pro neznámou objednávku.
+     * Provede příkaz orchestrátoru nad objednávkou; vrací prázdno pro neznámou objednávku.
      * Volá ho InboxService ve své transakci (deduplikaci už zajistil inbox).
      */
-    public Optional<Order> applyPaymentResult(PaymentResult result) {
-        Optional<Order> order = repository.findForUpdate(result.orderId());
+    public Optional<Order> applyCommand(OrderCommand command) {
+        Optional<Order> order = repository.findForUpdate(command.orderId());
         if (order.isEmpty()) {
-            // Výsledek pro neznámou objednávku retry nespraví – jen varování, zpráva se označí jako zpracovaná.
-            log.warn("Payment result {} for unknown order {} ignored", result.eventId(), result.orderId());
+            // Příkaz pro neznámou objednávku retry nespraví – jen varování, zpráva se označí jako zpracovaná.
+            log.warn("Command {} for unknown order {} ignored", command.eventId(), command.orderId());
             return order;
         }
         // Změna se uloží dirty checkingem při commitu transakce.
-        transition(order.get(), result);
+        transition(order.get(), command);
         return order;
     }
 
-    private void transition(Order order, PaymentResult result) {
+    private void transition(Order order, OrderCommand command) {
         if (order.status().isFinal()) {
-            log.warn("Order {} already in final state {}, payment result {} ignored", order.id(), order.status(),
-                    result.eventId());
+            log.warn("Order {} already in final state {}, command {} ignored", order.id(), order.status(),
+                    command.eventId());
             return;
         }
         OrderStatus previous = order.status();
         Instant now = clock.instant();
-        switch (result) {
-            case PaymentCompleted completed -> order.markPaid(completed.paymentId(), now);
-            case PaymentFailed failed -> order.markPaymentFailed(failed.reason(), now);
+        switch (command) {
+            case ConfirmOrder confirm -> order.markPaid(confirm.paymentId(), now);
+            case CancelOrder cancel -> order.markPaymentFailed(cancel.reason(), now);
         }
         log.info("Order {} status changed {} -> {}", order.id(), previous, order.status());
     }

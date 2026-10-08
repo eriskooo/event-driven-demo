@@ -1,6 +1,6 @@
 package cz.demo.eda.payment.domain;
 
-import cz.demo.eda.payment.event.OrderCreated;
+import cz.demo.eda.payment.event.ProcessPayment;
 import cz.demo.eda.payment.event.PaymentCompleted;
 import cz.demo.eda.payment.event.PaymentFailed;
 import cz.demo.eda.payment.event.PaymentResult;
@@ -23,7 +23,7 @@ class PaymentSimulatorTest {
     @DisplayName("Při failure-rate 0 platba vždy projde a nese correlationId i částku")
     void should_complete_whenFailureRateIsZero() {
         PaymentSimulator simulator = simulator(0.0, 0.0);
-        OrderCreated order = order("10.00");
+        ProcessPayment order = order("10.00");
 
         PaymentResult result = simulator.process(order);
 
@@ -78,7 +78,7 @@ class PaymentSimulatorTest {
         return new PaymentSimulator(new PaymentProperties(failureRate, POISON), fixedRandom);
     }
 
-    private static OrderCreated order(String amount) {
-        return OrderCreated.of("corr-1", "o-1", "c-1", new BigDecimal(amount), "CZK");
+    private static ProcessPayment order(String amount) {
+        return ProcessPayment.of("corr-1", "o-1", new BigDecimal(amount), "CZK");
     }
 }

@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class InboxRepositoryTest {
 
     private static final Instant NOW = Instant.now().truncatedTo(ChronoUnit.MICROS);
-    private static final String PAYLOAD = "{\"orderId\": \"o-1\", \"type\": \"PaymentCompleted\"}";
+    private static final String PAYLOAD = "{\"orderId\": \"o-1\", \"type\": \"ConfirmOrder\"}";
 
     @Autowired
     private InboxRepository repository;

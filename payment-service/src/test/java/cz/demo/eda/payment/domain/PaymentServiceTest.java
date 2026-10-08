@@ -1,6 +1,6 @@
 package cz.demo.eda.payment.domain;
 
-import cz.demo.eda.payment.event.OrderCreated;
+import cz.demo.eda.payment.event.ProcessPayment;
 import cz.demo.eda.payment.event.PaymentCompleted;
 import cz.demo.eda.payment.event.PaymentFailed;
 import cz.demo.eda.payment.outbox.OutboxPublisher;
@@ -45,7 +45,7 @@ class PaymentServiceTest {
     @Test
     @DisplayName("Úspěšnou platbu uloží a výsledek zařadí do outboxu payments.result")
     void should_saveAndPublish_whenPaymentCompleted() {
-        OrderCreated order = order("10.00");
+        ProcessPayment order = order("10.00");
         PaymentCompleted result = PaymentCompleted.of("c", "o-1", "p-1", order.amount());
         when(simulator.process(order)).thenReturn(result);
 
@@ -60,7 +60,7 @@ class PaymentServiceTest {
     @Test
     @DisplayName("Zamítnutou platbu také uloží a publikuje PaymentFailed")
     void should_saveAndPublish_whenPaymentDeclined() {
-        OrderCreated order = order("10.00");
+        ProcessPayment order = order("10.00");
         PaymentFailed result = PaymentFailed.of("c", "o-1", "declined");
         when(simulator.process(order)).thenReturn(result);
 
@@ -73,7 +73,7 @@ class PaymentServiceTest {
     @Test
     @DisplayName("Technická chyba simulace nic neuloží ani nepublikuje")
     void should_propagate_whenSimulatorFails() {
-        OrderCreated order = order("666");
+        ProcessPayment order = order("666");
         when(simulator.process(order)).thenThrow(new PaymentProcessingException("boom"));
 
         assertThatThrownBy(() -> service.processPayment(order)).isInstanceOf(PaymentProcessingException.class);
@@ -87,7 +87,7 @@ class PaymentServiceTest {
         return captor.getValue();
     }
 
-    private static OrderCreated order(String amount) {
-        return OrderCreated.of("c", "o-1", "cust", new BigDecimal(amount), "CZK");
+    private static ProcessPayment order(String amount) {
+        return ProcessPayment.of("c", "o-1", new BigDecimal(amount), "CZK");
     }
 }

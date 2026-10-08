@@ -23,7 +23,7 @@ import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Topicy, retry s backoffem a dead letter topic pro konzumenta orders.created. */
+/** Topicy, retry s backoffem a dead letter topic pro konzumenta payments.commands. */
 @Configuration(proxyBeanMethods = false)
 public class KafkaConfig {
 
@@ -37,10 +37,10 @@ public class KafkaConfig {
     KafkaAdmin.NewTopics edaTopics(EdaKafkaProperties properties) {
         EdaKafkaProperties.Topics settings = properties.topics();
         return new KafkaAdmin.NewTopics(
-                topic(Topics.ORDERS_CREATED, settings),
+                topic(Topics.PAYMENTS_COMMANDS, settings),
                 topic(Topics.PAYMENTS_RESULT, settings),
                 // DLT má stejný počet partitions, aby recoverer mohl zachovat číslo partition.
-                topic(Topics.dltOf(Topics.ORDERS_CREATED), settings));
+                topic(Topics.dltOf(Topics.PAYMENTS_COMMANDS), settings));
     }
 
     /** Error handler: retry s exponenciálním backoffem, poté publikace do &lt;topic&gt;.DLT. */
@@ -48,7 +48,7 @@ public class KafkaConfig {
     DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<Object, Object> kafkaTemplate,
                                           ProducerFactory<Object, Object> producerFactory,
                                           EdaKafkaProperties properties, MessagingMetrics metrics) {
-        metrics.deadLetterCounter(Topics.dltOf(Topics.ORDERS_CREATED));
+        metrics.deadLetterCounter(Topics.dltOf(Topics.PAYMENTS_COMMANDS));
         DeadLetterPublishingRecoverer recoverer = deadLetterRecoverer(kafkaTemplate, producerFactory);
         DefaultErrorHandler handler = new DefaultErrorHandler((record, ex) -> {
             recoverer.accept(record, ex);

@@ -15,7 +15,7 @@
     <artifactId>payment-service</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>payment-service</name>
-    <description>Simuluje platby pro vytvořené objednávky</description>
+    <description>Simuluje platby na příkaz orchestrátoru a publikuje jejich výsledek</description>
 
     <properties>
         <java.version>21</java.version>

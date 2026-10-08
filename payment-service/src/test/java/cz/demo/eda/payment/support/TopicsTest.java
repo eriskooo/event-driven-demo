@@ -10,7 +10,7 @@ class TopicsTest {
     @Test
     @DisplayName("Vrátí název DLT topicu s příponou .DLT")
     void should_appendDltSuffix_whenTopicGiven() {
-        assertThat(Topics.dltOf(Topics.ORDERS_CREATED)).isEqualTo("orders.created.DLT");
+        assertThat(Topics.dltOf(Topics.PAYMENTS_COMMANDS)).isEqualTo("payments.commands.DLT");
     }
 
     @Test

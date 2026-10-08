@@ -1,4 +1,4 @@
-# Základní deploy: Kafka, PostgreSQL a obě služby. Observabilitu přidávají overlaye v ../overlays.
+# Základní deploy: Kafka, PostgreSQL, Camunda a tři služby. Observabilitu přidávají overlaye v ../overlays.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -13,8 +13,10 @@ resources:
   - namespace.yaml
   - kafka/kafka.yaml
   - postgres/postgres.yaml
+  - camunda/camunda.yaml
   - order-service/order-service.yaml
   - payment-service/payment-service.yaml
+  - order-process/order-process.yaml
 
 # Image se buildí lokálně (imagePullPolicy: Never); tag lze přepsat např.
 # `kustomize edit set image order-service=order-service:1.2.3`.
@@ -22,4 +24,6 @@ images:
   - name: order-service
     newTag: dev
   - name: payment-service
+    newTag: dev
+  - name: order-process
     newTag: dev

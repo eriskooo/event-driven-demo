@@ -23,10 +23,10 @@ import java.nio.charset.StandardCharsets;
 public class DeadLetterListener {
 
     private static final Logger log = LoggerFactory.getLogger(DeadLetterListener.class);
-    private static final String DLT_TOPIC = Topics.ORDERS_CREATED + Topics.DLT_SUFFIX;
+    private static final String DLT_TOPIC = Topics.PAYMENTS_COMMANDS + Topics.DLT_SUFFIX;
 
     /** Zaloguje zprávu z DLT včetně důvodu selhání. */
-    @KafkaListener(id = "order-created-dlt-listener", idIsGroup = false, topics = DLT_TOPIC, groupId = "payment-service-dlt",
+    @KafkaListener(id = "process-payment-dlt-listener", idIsGroup = false, topics = DLT_TOPIC, groupId = "payment-service-dlt",
             properties = "value.deserializer=org.apache.kafka.common.serialization.StringDeserializer")
     public void onDeadLetter(ConsumerRecord<String, String> record, Acknowledgment ack) {
         Headers headers = record.headers();

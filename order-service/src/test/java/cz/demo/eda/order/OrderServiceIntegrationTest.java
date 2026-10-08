@@ -3,7 +3,7 @@ package cz.demo.eda.order;
 import cz.demo.eda.order.domain.Order;
 import cz.demo.eda.order.domain.OrderRepository;
 import cz.demo.eda.order.domain.OrderStatus;
-import cz.demo.eda.order.event.PaymentCompleted;
+import cz.demo.eda.order.event.ConfirmOrder;
 import cz.demo.eda.order.inbox.InboxEntry;
 import cz.demo.eda.order.inbox.InboxRepository;
 import cz.demo.eda.order.inbox.InboxStatus;
@@ -29,7 +29,6 @@ import org.testcontainers.kafka.KafkaContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
-import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
@@ -67,8 +66,8 @@ class OrderServiceIntegrationTest {
     private MeterRegistry registry;
 
     @Test
-    @DisplayName("Objednávka jde přes outbox do orders.created a PaymentCompleted ji přes inbox převede na PAID právě jednou")
-    void should_completeOrder_whenPaymentCompletedReceived() throws Exception {
+    @DisplayName("Objednávka jde přes outbox do orders.created a ConfirmOrder ji přes inbox převede na PAID právě jednou")
+    void should_completeOrder_whenConfirmOrderReceived() throws Exception {
         String body = mvc.perform(post("/orders")
                         .header(Tracing.CORRELATION_ID_HEADER, "it-corr-1")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -86,35 +85,35 @@ class OrderServiceIntegrationTest {
         assertThat(KafkaTestSupport.header(published, Tracing.CORRELATION_ID_HEADER)).isEqualTo("it-corr-1");
         await().atMost(TIMEOUT).until(() -> outbox.countByPublishedAtIsNull() == 0);
 
-        PaymentCompleted payment = PaymentCompleted.of("it-corr-1", orderId, "pay-1", new BigDecimal("42.00"));
-        sendPaymentResult(payment);
+        ConfirmOrder confirm = ConfirmOrder.of("it-corr-1", orderId, "pay-1");
+        sendCommand(confirm);
         await().atMost(TIMEOUT).untilAsserted(() ->
                 assertThat(orders.findById(orderId)).get().extracting(Order::status).isEqualTo(OrderStatus.PAID));
-        assertThat(inbox.findById(payment.eventId())).get().extracting(InboxEntry::status).isEqualTo(InboxStatus.PROCESSED);
+        assertThat(inbox.findById(confirm.eventId())).get().extracting(InboxEntry::status).isEqualTo(InboxStatus.PROCESSED);
 
-        // Stejná událost podruhé (at-least-once doručení) – inbox ji rozpozná jako duplicitu.
-        sendPaymentResult(payment);
+        // Stejný příkaz podruhé (at-least-once doručení) – inbox ji rozpozná jako duplicitu.
+        sendCommand(confirm);
         await().atMost(TIMEOUT).until(() -> counter(MessagingMetrics.CONSUMED, "outcome", "duplicate") >= 1);
         assertThat(orders.findById(orderId)).get().extracting(Order::paymentId).isEqualTo("pay-1");
     }
 
     @Test
-    @DisplayName("Nečitelná zpráva v payments.result skončí v DLT bez retry a do inboxu se nedostane")
-    void should_moveToDlt_whenPaymentResultUnreadable() {
-        KafkaTestSupport.sendRaw(kafka.getBootstrapServers(), Topics.PAYMENTS_RESULT, "bad-1", "this is not json");
+    @DisplayName("Nečitelná zpráva v orders.commands skončí v DLT bez retry a do inboxu se nedostane")
+    void should_moveToDlt_whenOrderCommandUnreadable() {
+        KafkaTestSupport.sendRaw(kafka.getBootstrapServers(), Topics.ORDERS_COMMANDS, "bad-1", "this is not json");
 
-        ConsumerRecord<String, String> dead = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.dltOf(Topics.PAYMENTS_RESULT),
+        ConsumerRecord<String, String> dead = KafkaTestSupport.awaitRecord(kafka.getBootstrapServers(), Topics.dltOf(Topics.ORDERS_COMMANDS),
                 r -> "bad-1".equals(r.key()), TIMEOUT);
 
         assertThat(dead.value()).isEqualTo("this is not json");
         assertThat(KafkaTestSupport.header(dead, KafkaHeaders.DLT_EXCEPTION_FQCN)).isNotBlank();
         await().atMost(TIMEOUT).until(() ->
-                counter(MessagingMetrics.DEAD_LETTERED, "topic", Topics.dltOf(Topics.PAYMENTS_RESULT)) == 1.0);
+                counter(MessagingMetrics.DEAD_LETTERED, "topic", Topics.dltOf(Topics.ORDERS_COMMANDS)) == 1.0);
     }
 
-    private void sendPaymentResult(PaymentCompleted payment) throws Exception {
-        ProducerRecord<Object, Object> record = new ProducerRecord<Object, Object>(Topics.PAYMENTS_RESULT, payment.orderId(), payment);
-        record.headers().add(Tracing.CORRELATION_ID_HEADER, payment.correlationId().getBytes(StandardCharsets.UTF_8));
+    private void sendCommand(ConfirmOrder confirm) throws Exception {
+        ProducerRecord<Object, Object> record = new ProducerRecord<Object, Object>(Topics.ORDERS_COMMANDS, confirm.orderId(), confirm);
+        record.headers().add(Tracing.CORRELATION_ID_HEADER, confirm.correlationId().getBytes(StandardCharsets.UTF_8));
         kafkaTemplate.send(record).get();
     }
 
